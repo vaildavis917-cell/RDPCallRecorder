@@ -33,6 +33,7 @@
 #include <tlhelp32.h>
 #include <algorithm>
 #include <atomic>
+#define SECURITY_WIN32
 #include <security.h>  // for GetUserNameExW (NameDisplay = Full Name)
 
 #pragma comment(lib, "comctl32.lib")
