@@ -1,5 +1,7 @@
 # RDP Call Recorder
 
+> **[Русская версия / Russian version](README_RU.md)**
+
 **Automatic call recording agent for RDP sessions.** Records WhatsApp, Telegram, and Viber calls with both caller and callee voices in a single audio file.
 
 ![RDP Call Recorder](src/app.ico)
