@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(RDPCallRecorder VERSION 2.1.0 LANGUAGES CXX)
+project(RDPCallRecorder VERSION 2.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -77,6 +77,7 @@ target_link_libraries(RDPCallRecorder PRIVATE
     User32.lib
     Gdi32.lib
     Advapi32.lib
+    Secur32.lib
 )
 
 # =============================================================

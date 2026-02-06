@@ -13,7 +13,7 @@
 - **Background operation** — runs silently in the system tray, no user interaction required
 - **Auto-start** — registers itself in Windows startup on first launch
 - **Settings GUI** — change recording folder, audio format, target processes, and more at any time
-- **Smart file naming** — `{Date}_{RDP-User}_{App}_{Time}.mp3` (e.g., `2026-02-06_Ivanov_WhatsApp_14-30-25.mp3`)
+- **Smart file naming** — `{Date}_{FullName}_{App}_{Time}.mp3` (e.g., `2026-02-06_Nicole_WhatsApp_14-30-25.mp3`) — uses the user's Full Name from Windows profile
 - **RDP-aware** — only monitors processes in the current RDP session
 - **User-level installation** — no admin rights required, installs to user's AppData folder
 - **NSIS installer** — one-click setup with desktop shortcut and uninstaller
@@ -73,10 +73,10 @@ Double-click the tray icon or the desktop shortcut to open settings:
 Recordings are organized as:
 ```
 %USERPROFILE%\CallRecordings\
-  {Username}\
+  {FullName}\
     {Date}\
-      2026-02-06_Ivanov_WhatsApp_14-30-25.mp3
-      2026-02-06_Ivanov_Telegram_15-45-10.mp3
+      2026-02-06_Nicole_WhatsApp_14-30-25.mp3
+      2026-02-06_Nicole_Telegram_15-45-10.mp3
     logs\
       agent.log
 ```

@@ -33,9 +33,11 @@
 #include <tlhelp32.h>
 #include <algorithm>
 #include <atomic>
+#include <security.h>  // for GetUserNameExW (NameDisplay = Full Name)
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "secur32.lib")
 
 namespace fs = std::filesystem;
 
@@ -196,11 +198,61 @@ void SetProcessPriorityFromConfig(const std::wstring& priority) {
     SetPriorityClass(GetCurrentProcess(), priorityClass);
 }
 
-std::wstring GetCurrentUsername() {
+// Get user's Full Name (e.g. "Nicole" instead of "user-5")
+// Falls back to login name if Full Name is not set
+std::wstring GetCurrentFullName() {
+    // Try to get display name (Full Name from user profile)
+    wchar_t fullName[256] = { 0 };
+    ULONG size = 256;
+    if (GetUserNameExW(NameDisplay, fullName, &size) && size > 1 && wcslen(fullName) > 0) {
+        return std::wstring(fullName);
+    }
+
+    // Fallback: try NameSamCompatible and strip domain
+    size = 256;
+    if (GetUserNameExW(NameSamCompatible, fullName, &size) && size > 1) {
+        std::wstring samName(fullName);
+        // Strip domain prefix (DOMAIN\user -> user)
+        size_t pos = samName.find(L'\\');
+        if (pos != std::wstring::npos) {
+            samName = samName.substr(pos + 1);
+        }
+        // Don't return SAM name - we want Full Name, not login
+    }
+
+    // Final fallback: regular login name
+    wchar_t username[256] = { 0 };
+    DWORD usize = 256;
+    if (GetUserNameW(username, &usize)) return std::wstring(username);
+    return L"Unknown";
+}
+
+// Get login name (for logging purposes)
+std::wstring GetCurrentLoginName() {
     wchar_t username[256] = { 0 };
     DWORD size = 256;
     if (GetUserNameW(username, &size)) return std::wstring(username);
     return L"Unknown";
+}
+
+// Sanitize name for use in file/folder names (remove invalid chars)
+std::wstring SanitizeForPath(const std::wstring& name) {
+    std::wstring result;
+    for (wchar_t ch : name) {
+        // Replace invalid filename chars with underscore
+        if (ch == L'\\' || ch == L'/' || ch == L':' || ch == L'*' ||
+            ch == L'?' || ch == L'"' || ch == L'<' || ch == L'>' || ch == L'|') {
+            result += L'_';
+        } else {
+            result += ch;
+        }
+    }
+    // Trim trailing spaces/dots
+    while (!result.empty() && (result.back() == L' ' || result.back() == L'.')) {
+        result.pop_back();
+    }
+    if (result.empty()) result = L"Unknown";
+    return result;
 }
 
 // ============================================================
@@ -326,7 +378,7 @@ void Log(const std::wstring& message, LogLevel level) {
 
     std::wstring logLine = std::wstring(timeStr) + L" [" + levelStr + L"] " + message + L"\n";
 
-    fs::path logDir = fs::path(g_config.recordingPath) / GetCurrentUsername() / L"logs";
+    fs::path logDir = fs::path(g_config.recordingPath) / SanitizeForPath(GetCurrentFullName()) / L"logs";
     try {
         fs::create_directories(logDir);
         fs::path logFile = logDir / L"agent.log";
@@ -384,7 +436,7 @@ std::wstring BuildOutputPath(const std::wstring& processName, AudioFormat format
     struct tm tmNow;
     localtime_s(&tmNow, &time_t_now);
 
-    std::wstring username = GetCurrentUsername();
+    std::wstring username = SanitizeForPath(GetCurrentFullName());
 
     wchar_t dateStr[32];
     swprintf_s(dateStr, 32, L"%04d-%02d-%02d",
@@ -1137,7 +1189,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Log startup
     Log(L"=== RDP Call Recorder Agent v2.3 started ===");
-    Log(L"User: " + GetCurrentUsername());
+    Log(L"User: " + GetCurrentFullName() + L" (login: " + GetCurrentLoginName() + L")");
     Log(L"Recording path: " + g_config.recordingPath);
     Log(L"Mode: Mixed recording (both voices)");
 
