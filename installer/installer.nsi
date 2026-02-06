@@ -1,6 +1,7 @@
 ; ============================================================
 ; RDP Call Recorder - NSIS Installer Script
-; Version: 2.1
+; Version: 2.3
+; User-level installation (no admin rights required)
 ; ============================================================
 ; Build instructions:
 ;   1. Install NSIS: https://nsis.sourceforge.io/Download
@@ -14,17 +15,17 @@
 ; --- Main parameters ---
 Name "RDP Call Recorder"
 OutFile "RDPCallRecorder_Setup.exe"
-InstallDir "$PROGRAMFILES\RDPCallRecorder"
-InstallDirRegKey HKLM "Software\RDPCallRecorder" "InstallDir"
-RequestExecutionLevel admin
+InstallDir "$LOCALAPPDATA\RDPCallRecorder"
+InstallDirRegKey HKCU "Software\RDPCallRecorder" "InstallDir"
+RequestExecutionLevel user
 Unicode true
 
 ; --- Metadata ---
-VIProductVersion "2.1.0.0"
+VIProductVersion "2.3.0.0"
 VIAddVersionKey "ProductName" "RDP Call Recorder"
 VIAddVersionKey "CompanyName" "QC Department"
 VIAddVersionKey "FileDescription" "Call Recording Agent for RDP Sessions"
-VIAddVersionKey "FileVersion" "2.1.0"
+VIAddVersionKey "FileVersion" "2.3.0"
 VIAddVersionKey "LegalCopyright" "Internal Use Only"
 
 ; --- Interface ---
@@ -34,7 +35,7 @@ VIAddVersionKey "LegalCopyright" "Internal Use Only"
 
 ; --- Finish page: launch app after install ---
 !define MUI_FINISHPAGE_RUN "$INSTDIR\RDPCallRecorder.exe"
-!define MUI_FINISHPAGE_RUN_TEXT "Launch RDP Call Recorder (opens settings)"
+!define MUI_FINISHPAGE_RUN_TEXT "Запустить RDP Call Recorder (откроет настройки)"
 !define MUI_FINISHPAGE_RUN_CHECKED
 
 ; --- Install pages ---
@@ -62,21 +63,21 @@ Section "Install"
     File "files\config.ini"
     File "app.ico"
 
-    ; Save install path to registry
-    WriteRegStr HKLM "Software\RDPCallRecorder" "InstallDir" "$INSTDIR"
+    ; Save install path to registry (HKCU - user level)
+    WriteRegStr HKCU "Software\RDPCallRecorder" "InstallDir" "$INSTDIR"
 
-    ; Autostart for ALL users on the server (HKLM)
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Run" \
+    ; Autostart for current user (HKCU)
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" \
         "RDPCallRecorder" '"$INSTDIR\RDPCallRecorder.exe"'
 
-    ; Create desktop shortcut (for ALL users)
-    SetShellVarContext all
+    ; Create desktop shortcut (current user only)
+    SetShellVarContext current
     CreateShortCut "$DESKTOP\RDP Call Recorder.lnk" \
         "$INSTDIR\RDPCallRecorder.exe" "" \
         "$INSTDIR\app.ico" 0 \
         SW_SHOWNORMAL "" "RDP Call Recorder - Settings"
 
-    ; Create Start Menu shortcut
+    ; Create Start Menu shortcut (current user only)
     CreateDirectory "$SMPROGRAMS\RDP Call Recorder"
     CreateShortCut "$SMPROGRAMS\RDP Call Recorder\RDP Call Recorder.lnk" \
         "$INSTDIR\RDPCallRecorder.exe" "" \
@@ -87,20 +88,22 @@ Section "Install"
     ; Create uninstaller
     WriteUninstaller "$INSTDIR\Uninstall.exe"
 
-    ; Register in "Programs and Features"
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
+    ; Register in "Programs and Features" (HKCU - user level)
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
         "DisplayName" "RDP Call Recorder"
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
         "UninstallString" '"$INSTDIR\Uninstall.exe"'
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
         "InstallLocation" "$INSTDIR"
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
-        "DisplayVersion" "2.1.0"
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
+        "DisplayVersion" "2.3.0"
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
         "Publisher" "QC Department"
-    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
+        "DisplayIcon" "$INSTDIR\app.ico"
+    WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
         "NoModify" 1
-    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
+    WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
         "NoRepair" 1
 
 SectionEnd
@@ -113,14 +116,11 @@ Section "Uninstall"
     ; Kill all running instances
     nsExec::ExecToLog 'taskkill /F /IM RDPCallRecorder.exe'
 
-    ; Remove autostart from HKLM
-    DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "RDPCallRecorder"
-
-    ; Remove autostart from HKCU (agent registers itself there too)
+    ; Remove autostart (HKCU)
     DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "RDPCallRecorder"
 
-    ; Remove desktop shortcut
-    SetShellVarContext all
+    ; Remove desktop shortcut (current user)
+    SetShellVarContext current
     Delete "$DESKTOP\RDP Call Recorder.lnk"
 
     ; Remove Start Menu
@@ -135,9 +135,9 @@ Section "Uninstall"
     Delete "$INSTDIR\Uninstall.exe"
     RMDir "$INSTDIR"
 
-    ; Remove registry keys
-    DeleteRegKey HKLM "Software\RDPCallRecorder"
-    DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder"
+    ; Remove registry keys (HKCU)
+    DeleteRegKey HKCU "Software\RDPCallRecorder"
+    DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder"
 
     ; NOTE: Recordings folder is NOT deleted - recordings are preserved!
 

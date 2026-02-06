@@ -15,6 +15,7 @@
 - **Settings GUI** — change recording folder, audio format, target processes, and more at any time
 - **Smart file naming** — `{Date}_{RDP-User}_{App}_{Time}.mp3` (e.g., `2026-02-06_Ivanov_WhatsApp_14-30-25.mp3`)
 - **RDP-aware** — only monitors processes in the current RDP session
+- **User-level installation** — no admin rights required, installs to user's AppData folder
 - **NSIS installer** — one-click setup with desktop shortcut and uninstaller
 - **Configurable** — all settings stored in `config.ini`
 
@@ -34,10 +35,19 @@
 ### From Installer (Recommended)
 
 1. Download `RDPCallRecorder_Setup.exe` from the [Releases](../../releases) page
-2. Run the installer as Administrator on the RDP server
-3. A desktop shortcut will be created — click it to open settings
-4. Select your recording folder and click Save
-5. Done! The agent will auto-start on every RDP login
+2. **Run the installer as a regular user** (no admin rights needed!)
+3. The program installs to `%LOCALAPPDATA%\RDPCallRecorder\` (current user's folder)
+4. A desktop shortcut will be created — click it to open settings
+5. Select your recording folder (default: `%USERPROFILE%\CallRecordings`) and click Save
+6. Done! The agent will auto-start on every RDP login
+
+### Important: Per-User Installation
+
+Each RDP user should install the program **individually** under their own account. This ensures:
+- All folders and files are owned by the user (no permission issues)
+- Auto-start works for the specific user
+- Recordings are saved in the user's profile
+- No admin rights required
 
 ### From Source
 
@@ -49,7 +59,7 @@ Double-click the tray icon or the desktop shortcut to open settings:
 
 | Setting | Description | Default |
 |---------|-------------|---------|
-| Recording folder | Where to save recordings | `D:\CallRecordings` |
+| Recording folder | Where to save recordings | `%USERPROFILE%\CallRecordings` |
 | Audio format | MP3 or WAV | MP3 |
 | MP3 Bitrate | Audio quality (kbps) | 128 |
 | Target processes | Comma-separated list | `WhatsApp.exe, Telegram.exe, Viber.exe` |
@@ -62,13 +72,22 @@ Double-click the tray icon or the desktop shortcut to open settings:
 
 Recordings are organized as:
 ```
-{RecordingFolder}/
-  {Username}/
-    {Date}/
+%USERPROFILE%\CallRecordings\
+  {Username}\
+    {Date}\
       2026-02-06_Ivanov_WhatsApp_14-30-25.mp3
       2026-02-06_Ivanov_Telegram_15-45-10.mp3
-    logs/
+    logs\
       agent.log
+```
+
+Program is installed to:
+```
+%LOCALAPPDATA%\RDPCallRecorder\
+  RDPCallRecorder.exe
+  config.ini
+  app.ico
+  Uninstall.exe
 ```
 
 ## Building from Source
@@ -87,7 +106,7 @@ This project uses the [AudioCapture](https://github.com/masonasons/AudioCapture)
 ```cmd
 cd C:\Projects
 git clone https://github.com/masonasons/AudioCapture.git
-git clone https://github.com/YOUR_USERNAME/RDPCallRecorder.git
+git clone https://github.com/vaildavis917-cell/RDPCallRecorder.git
 ```
 
 ### Build Steps
@@ -117,11 +136,12 @@ cd ..\installer
 
 ## Configuration File
 
-The `config.ini` file is located next to the executable:
+The `config.ini` file is located next to the executable (`%LOCALAPPDATA%\RDPCallRecorder\config.ini`):
 
 ```ini
 [Recording]
-RecordingPath=D:\CallRecordings
+; Leave empty for auto-detection (%USERPROFILE%\CallRecordings)
+RecordingPath=
 AudioFormat=mp3
 MP3Bitrate=128000
 
@@ -154,7 +174,13 @@ ProcessPriority=BelowNormal
 Windows Defender may flag the application as `Behavior:Win32/Persistence.Alml` because it registers itself in Windows startup. This is a **false positive**. Add an exclusion for the installation folder:
 
 ```powershell
-Add-MpPreference -ExclusionPath "C:\Program Files\RDPCallRecorder\"
+# For user-level installation (admin rights needed to add exclusion):
+Add-MpPreference -ExclusionPath "$env:LOCALAPPDATA\RDPCallRecorder\"
+```
+
+Or ask the RDP server administrator to add an exclusion for all users:
+```powershell
+Add-MpPreference -ExclusionPath "C:\Users\*\AppData\Local\RDPCallRecorder\"
 ```
 
 ## License

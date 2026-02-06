@@ -1,4 +1,4 @@
-// main.cpp - RDP Call Recorder Agent v2.2
+// main.cpp - RDP Call Recorder Agent v2.3
 // Records WhatsApp/Telegram/Viber calls automatically in RDP sessions.
 // Uses AudioCapture library (https://github.com/masonasons/AudioCapture)
 //
@@ -64,7 +64,7 @@ static const DWORD MIC_SESSION_ID_BASE = 0xF0000000;
 // Global configuration
 // ============================================================
 struct AgentConfig {
-    std::wstring recordingPath = L"D:\\CallRecordings";
+    std::wstring recordingPath = L"";  // Will be set to %USERPROFILE%\CallRecordings at runtime
     std::wstring audioFormat = L"mp3";
     UINT32 mp3Bitrate = 128000;
     int pollIntervalSeconds = 2;
@@ -150,6 +150,19 @@ std::vector<std::wstring> SplitString(const std::wstring& str, wchar_t delimiter
     return tokens;
 }
 
+std::wstring GetDefaultRecordingPath() {
+    wchar_t userProfile[MAX_PATH] = { 0 };
+    if (ExpandEnvironmentStringsW(L"%USERPROFILE%\\CallRecordings", userProfile, MAX_PATH) > 0) {
+        return std::wstring(userProfile);
+    }
+    // Fallback: use LOCALAPPDATA
+    wchar_t localAppData[MAX_PATH] = { 0 };
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, localAppData))) {
+        return std::wstring(localAppData) + L"\\RDPCallRecorder\\Recordings";
+    }
+    return L"C:\\CallRecordings";
+}
+
 std::wstring GetExePath() {
     wchar_t exePath[MAX_PATH] = { 0 };
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
@@ -194,6 +207,11 @@ std::wstring GetCurrentUsername() {
 // Load / Save configuration
 // ============================================================
 bool LoadConfig(AgentConfig& config) {
+    // Set default recording path based on user profile
+    if (config.recordingPath.empty()) {
+        config.recordingPath = GetDefaultRecordingPath();
+    }
+
     std::wstring iniPath = GetConfigPath();
     if (!fs::exists(iniPath)) return false;
 
@@ -247,6 +265,7 @@ void SaveConfig() {
     WritePrivateProfileStringW(L"Advanced", L"HideConsole", g_config.hideConsole ? L"true" : L"false", iniPath.c_str());
     WritePrivateProfileStringW(L"Advanced", L"AutoRegisterStartup", g_config.autoRegisterStartup ? L"true" : L"false", iniPath.c_str());
     WritePrivateProfileStringW(L"Advanced", L"ProcessPriority", g_config.processPriority.c_str(), iniPath.c_str());
+    WritePrivateProfileStringW(L"Advanced", L"Configured", L"true", iniPath.c_str());
 }
 
 // ============================================================
@@ -1057,9 +1076,10 @@ void MonitorThread() {
 bool IsFirstLaunch() {
     std::wstring iniPath = GetConfigPath();
     if (!fs::exists(iniPath)) return true;
-
-    std::wstring path = GetIniString(L"Recording", L"RecordingPath", L"", iniPath);
-    return path.empty();
+    // Check if config has been saved at least once by looking for a marker
+    std::wstring marker = GetIniString(L"Advanced", L"Configured", L"false", iniPath);
+    std::transform(marker.begin(), marker.end(), marker.begin(), ::towlower);
+    return (marker != L"true" && marker != L"1" && marker != L"yes");
 }
 
 // ============================================================
@@ -1116,7 +1136,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     CreateTrayIcon(g_hWndMain);
 
     // Log startup
-    Log(L"=== RDP Call Recorder Agent v2.2 started ===");
+    Log(L"=== RDP Call Recorder Agent v2.3 started ===");
     Log(L"User: " + GetCurrentUsername());
     Log(L"Recording path: " + g_config.recordingPath);
     Log(L"Mode: Mixed recording (both voices)");
