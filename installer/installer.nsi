@@ -1,0 +1,144 @@
+; ============================================================
+; RDP Call Recorder - NSIS Installer Script
+; Version: 2.1
+; ============================================================
+; Build instructions:
+;   1. Install NSIS: https://nsis.sourceforge.io/Download
+;   2. Place RDPCallRecorder.exe and config.ini in installer\files\
+;   3. Run: makensis installer.nsi
+;   4. Result: RDPCallRecorder_Setup.exe
+; ============================================================
+
+!include "MUI2.nsh"
+
+; --- Main parameters ---
+Name "RDP Call Recorder"
+OutFile "RDPCallRecorder_Setup.exe"
+InstallDir "$PROGRAMFILES\RDPCallRecorder"
+InstallDirRegKey HKLM "Software\RDPCallRecorder" "InstallDir"
+RequestExecutionLevel admin
+Unicode true
+
+; --- Metadata ---
+VIProductVersion "2.1.0.0"
+VIAddVersionKey "ProductName" "RDP Call Recorder"
+VIAddVersionKey "CompanyName" "QC Department"
+VIAddVersionKey "FileDescription" "Call Recording Agent for RDP Sessions"
+VIAddVersionKey "FileVersion" "2.1.0"
+VIAddVersionKey "LegalCopyright" "Internal Use Only"
+
+; --- Interface ---
+!define MUI_ABORTWARNING
+!define MUI_ICON "app.ico"
+!define MUI_UNICON "app.ico"
+
+; --- Finish page: launch app after install ---
+!define MUI_FINISHPAGE_RUN "$INSTDIR\RDPCallRecorder.exe"
+!define MUI_FINISHPAGE_RUN_TEXT "Launch RDP Call Recorder (opens settings)"
+!define MUI_FINISHPAGE_RUN_CHECKED
+
+; --- Install pages ---
+!insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+
+; --- Uninstall pages ---
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+
+; --- Language ---
+!insertmacro MUI_LANGUAGE "Russian"
+!insertmacro MUI_LANGUAGE "English"
+
+; ============================================================
+; Install section
+; ============================================================
+Section "Install"
+    SetOutPath "$INSTDIR"
+
+    ; Copy files
+    File "files\RDPCallRecorder.exe"
+    File "files\config.ini"
+    File "app.ico"
+
+    ; Save install path to registry
+    WriteRegStr HKLM "Software\RDPCallRecorder" "InstallDir" "$INSTDIR"
+
+    ; Autostart for ALL users on the server (HKLM)
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Run" \
+        "RDPCallRecorder" '"$INSTDIR\RDPCallRecorder.exe"'
+
+    ; Create desktop shortcut (for ALL users)
+    SetShellVarContext all
+    CreateShortCut "$DESKTOP\RDP Call Recorder.lnk" \
+        "$INSTDIR\RDPCallRecorder.exe" "" \
+        "$INSTDIR\app.ico" 0 \
+        SW_SHOWNORMAL "" "RDP Call Recorder - Settings"
+
+    ; Create Start Menu shortcut
+    CreateDirectory "$SMPROGRAMS\RDP Call Recorder"
+    CreateShortCut "$SMPROGRAMS\RDP Call Recorder\RDP Call Recorder.lnk" \
+        "$INSTDIR\RDPCallRecorder.exe" "" \
+        "$INSTDIR\app.ico" 0
+    CreateShortCut "$SMPROGRAMS\RDP Call Recorder\Uninstall.lnk" \
+        "$INSTDIR\Uninstall.exe"
+
+    ; Create uninstaller
+    WriteUninstaller "$INSTDIR\Uninstall.exe"
+
+    ; Register in "Programs and Features"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
+        "DisplayName" "RDP Call Recorder"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
+        "UninstallString" '"$INSTDIR\Uninstall.exe"'
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
+        "InstallLocation" "$INSTDIR"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
+        "DisplayVersion" "2.1.0"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
+        "Publisher" "QC Department"
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
+        "NoModify" 1
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
+        "NoRepair" 1
+
+SectionEnd
+
+; ============================================================
+; Uninstall section
+; ============================================================
+Section "Uninstall"
+
+    ; Kill all running instances
+    nsExec::ExecToLog 'taskkill /F /IM RDPCallRecorder.exe'
+
+    ; Remove autostart from HKLM
+    DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "RDPCallRecorder"
+
+    ; Remove autostart from HKCU (agent registers itself there too)
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "RDPCallRecorder"
+
+    ; Remove desktop shortcut
+    SetShellVarContext all
+    Delete "$DESKTOP\RDP Call Recorder.lnk"
+
+    ; Remove Start Menu
+    Delete "$SMPROGRAMS\RDP Call Recorder\RDP Call Recorder.lnk"
+    Delete "$SMPROGRAMS\RDP Call Recorder\Uninstall.lnk"
+    RMDir "$SMPROGRAMS\RDP Call Recorder"
+
+    ; Remove files
+    Delete "$INSTDIR\RDPCallRecorder.exe"
+    Delete "$INSTDIR\config.ini"
+    Delete "$INSTDIR\app.ico"
+    Delete "$INSTDIR\Uninstall.exe"
+    RMDir "$INSTDIR"
+
+    ; Remove registry keys
+    DeleteRegKey HKLM "Software\RDPCallRecorder"
+    DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder"
+
+    ; NOTE: Recordings folder is NOT deleted - recordings are preserved!
+
+SectionEnd

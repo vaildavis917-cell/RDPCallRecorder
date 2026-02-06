@@ -1,0 +1,5 @@
+// Resource file for RDP Call Recorder
+#include "resource.h"
+
+// Application icon
+IDI_APPICON ICON "app.ico"
