@@ -1,4 +1,4 @@
-// main.cpp - RDP Call Recorder Agent v2.3
+// main.cpp - RDP Call Recorder Agent v2.4
 // Records WhatsApp/Telegram/Viber calls automatically in RDP sessions.
 // Uses AudioCapture library (https://github.com/masonasons/AudioCapture)
 //
@@ -33,6 +33,9 @@
 #include <tlhelp32.h>
 #include <algorithm>
 #include <atomic>
+#include <mmdeviceapi.h>
+#include <audiopolicy.h>
+#include <endpointvolume.h>
 #define SECURITY_WIN32
 #include <security.h>  // for GetUserNameExW (NameDisplay = Full Name)
 
@@ -72,6 +75,7 @@ struct AgentConfig {
     UINT32 mp3Bitrate = 128000;
     int pollIntervalSeconds = 2;
     int silenceThreshold = 3;
+    int startThreshold = 2;  // How many consecutive polls with audio before starting recording
     std::vector<std::wstring> targetProcesses = { L"WhatsApp.exe", L"Telegram.exe", L"Viber.exe" };
     bool enableLogging = true;
     std::wstring logLevel = L"INFO";
@@ -274,8 +278,10 @@ bool LoadConfig(AgentConfig& config) {
 
     config.pollIntervalSeconds = GetIniInt(L"Monitoring", L"PollInterval", config.pollIntervalSeconds, iniPath);
     config.silenceThreshold    = GetIniInt(L"Monitoring", L"SilenceThreshold", config.silenceThreshold, iniPath);
+    config.startThreshold      = GetIniInt(L"Monitoring", L"StartThreshold", config.startThreshold, iniPath);
     if (config.pollIntervalSeconds < 1) config.pollIntervalSeconds = 1;
     if (config.silenceThreshold < 1) config.silenceThreshold = 1;
+    if (config.startThreshold < 1) config.startThreshold = 1;
 
     std::wstring processesStr = GetIniString(L"Processes", L"TargetProcesses", L"WhatsApp.exe,Telegram.exe,Viber.exe", iniPath);
     auto parsed = SplitString(processesStr, L',');
@@ -303,6 +309,7 @@ void SaveConfig() {
 
     WritePrivateProfileStringW(L"Monitoring", L"PollInterval", std::to_wstring(g_config.pollIntervalSeconds).c_str(), iniPath.c_str());
     WritePrivateProfileStringW(L"Monitoring", L"SilenceThreshold", std::to_wstring(g_config.silenceThreshold).c_str(), iniPath.c_str());
+    WritePrivateProfileStringW(L"Monitoring", L"StartThreshold", std::to_wstring(g_config.startThreshold).c_str(), iniPath.c_str());
 
     std::wstring procStr;
     for (size_t i = 0; i < g_config.targetProcesses.size(); i++) {
@@ -504,6 +511,92 @@ std::vector<FoundProcess> FindTargetProcesses() {
     }
     CloseHandle(hSnapshot);
     return result;
+}
+
+// ============================================================
+// Check if process has REAL audio output (not just registered session)
+// Uses IAudioMeterInformation to check actual peak level.
+// Returns true only if the process is actually producing sound.
+// This prevents false triggers from:
+//   - MicroSIP audio "leaking" into Telegram's session
+//   - Idle audio sessions that are registered but silent
+// ============================================================
+bool CheckProcessRealAudio(DWORD processId, float threshold = 0.01f) {
+    bool hasRealAudio = false;
+
+    IMMDeviceEnumerator* deviceEnumerator = nullptr;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
+        CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
+        reinterpret_cast<void**>(&deviceEnumerator));
+    if (FAILED(hr) || !deviceEnumerator) return false;
+
+    IMMDevice* device = nullptr;
+    hr = deviceEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+    if (FAILED(hr) || !device) {
+        deviceEnumerator->Release();
+        return false;
+    }
+
+    IAudioSessionManager2* sessionManager = nullptr;
+    hr = device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL,
+        nullptr, reinterpret_cast<void**>(&sessionManager));
+    if (FAILED(hr) || !sessionManager) {
+        device->Release();
+        deviceEnumerator->Release();
+        return false;
+    }
+
+    IAudioSessionEnumerator* sessionEnumerator = nullptr;
+    hr = sessionManager->GetSessionEnumerator(&sessionEnumerator);
+    if (FAILED(hr) || !sessionEnumerator) {
+        sessionManager->Release();
+        device->Release();
+        deviceEnumerator->Release();
+        return false;
+    }
+
+    int sessionCount = 0;
+    sessionEnumerator->GetCount(&sessionCount);
+
+    for (int i = 0; i < sessionCount; i++) {
+        IAudioSessionControl* sessionControl = nullptr;
+        if (FAILED(sessionEnumerator->GetSession(i, &sessionControl)) || !sessionControl)
+            continue;
+
+        IAudioSessionControl2* sessionControl2 = nullptr;
+        if (SUCCEEDED(sessionControl->QueryInterface(__uuidof(IAudioSessionControl2),
+            reinterpret_cast<void**>(&sessionControl2)))) {
+
+            DWORD sessionProcessId = 0;
+            if (SUCCEEDED(sessionControl2->GetProcessId(&sessionProcessId))) {
+                if (sessionProcessId == processId) {
+                    // Found session for our process - check REAL audio level
+                    IAudioMeterInformation* meter = nullptr;
+                    if (SUCCEEDED(sessionControl->QueryInterface(__uuidof(IAudioMeterInformation),
+                        reinterpret_cast<void**>(&meter)))) {
+                        float peakLevel = 0.0f;
+                        if (SUCCEEDED(meter->GetPeakValue(&peakLevel))) {
+                            if (peakLevel > threshold) {
+                                hasRealAudio = true;
+                            }
+                        }
+                        meter->Release();
+                    }
+                }
+            }
+            sessionControl2->Release();
+        }
+        sessionControl->Release();
+
+        if (hasRealAudio) break;
+    }
+
+    sessionEnumerator->Release();
+    sessionManager->Release();
+    device->Release();
+    deviceEnumerator->Release();
+
+    return hasRealAudio;
 }
 
 // ============================================================
@@ -947,6 +1040,7 @@ void MonitorThread() {
     // Track recording state per process
     std::map<DWORD, CallRecordingState> callState;
     std::map<DWORD, int> silenceCounter;
+    std::map<DWORD, int> startCounter;  // How many consecutive polls with REAL audio before starting
     DWORD nextMicSessionId = MIC_SESSION_ID_BASE;
 
     while (g_running) {
@@ -961,10 +1055,25 @@ void MonitorThread() {
                 DWORD pid = targetProcs[i].pid;
                 std::wstring name = targetProcs[i].name;
                 currentPids.insert(pid);
-                bool hasAudio = processEnum.CheckProcessHasActiveAudio(pid);
+                // Use CheckProcessRealAudio instead of CheckProcessHasActiveAudio
+                // This checks actual peak audio level, not just session state.
+                // Prevents false triggers from MicroSIP or other apps.
+                bool hasRealAudio = CheckProcessRealAudio(pid);
 
-                if (hasAudio && !callState[pid].isRecording) {
-                    // ---- CALL STARTED ----
+                if (hasRealAudio && !callState[pid].isRecording) {
+                    // ---- AUDIO DETECTED, CHECK START THRESHOLD ----
+                    startCounter[pid]++;
+                    Log(L"Audio detected: " + name + L" PID=" + std::to_wstring(pid) +
+                        L" count=" + std::to_wstring(startCounter[pid]) +
+                        L"/" + std::to_wstring(g_config.startThreshold), LogLevel::LOG_DEBUG);
+
+                    if (startCounter[pid] < g_config.startThreshold) {
+                        // Not enough consecutive polls yet - could be just a notification
+                        continue;
+                    }
+
+                    // ---- CALL CONFIRMED (sustained audio) ----
+                    startCounter[pid] = 0;
                     silenceCounter[pid] = 0;
                     std::wstring outputPath = BuildOutputPath(name, audioFormat);
 
@@ -1040,7 +1149,11 @@ void MonitorThread() {
                     }
                     UpdateTrayTooltip();
 
-                } else if (!hasAudio && callState[pid].isRecording) {
+                } else if (!hasRealAudio && !callState[pid].isRecording) {
+                    // No audio and not recording - reset start counter
+                    startCounter[pid] = 0;
+
+                } else if (!hasRealAudio && callState[pid].isRecording) {
                     // ---- SILENCE DETECTED ----
                     silenceCounter[pid]++;
                     if (silenceCounter[pid] >= g_config.silenceThreshold) {
@@ -1070,7 +1183,7 @@ void MonitorThread() {
                         UpdateTrayTooltip();
                     }
 
-                } else if (hasAudio && callState[pid].isRecording) {
+                } else if (hasRealAudio && callState[pid].isRecording) {
                     // Still active - reset silence counter
                     silenceCounter[pid] = 0;
                 }
@@ -1100,6 +1213,7 @@ void MonitorThread() {
             for (size_t i = 0; i < toRemove.size(); i++) {
                 callState.erase(toRemove[i]);
                 silenceCounter.erase(toRemove[i]);
+                startCounter.erase(toRemove[i]);
             }
 
             UpdateTrayTooltip();
@@ -1189,7 +1303,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     CreateTrayIcon(g_hWndMain);
 
     // Log startup
-    Log(L"=== RDP Call Recorder Agent v2.3 started ===");
+    Log(L"=== RDP Call Recorder Agent v2.4 started ===");
     Log(L"User: " + GetCurrentFullName() + L" (login: " + GetCurrentLoginName() + L")");
     Log(L"Recording path: " + g_config.recordingPath);
     Log(L"Mode: Mixed recording (both voices)");
