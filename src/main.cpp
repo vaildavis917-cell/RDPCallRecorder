@@ -1,4 +1,4 @@
-// main.cpp - RDP Call Recorder Agent v2.4
+// main.cpp - RDP Call Recorder Agent v2.5
 // Records WhatsApp/Telegram/Viber calls automatically in RDP sessions.
 // Uses AudioCapture library (https://github.com/masonasons/AudioCapture)
 //
@@ -10,6 +10,24 @@
 //   - If launched again, opens settings in running instance
 //   - Auto-registers in startup on first run
 //   - Desktop shortcut created by installer
+//
+// v2.5 Changes:
+//   - [C1] Thread-safe config access via mutex
+//   - [C2] Fixed GDI font handle leak in Settings dialog
+//   - [C3] Fixed lossy string conversion (now uses MultiByteToWideChar)
+//   - [C4] Fixed simultaneous calls breaking mixed recording
+//   - [C5] Fixed Global mutex blocking all RDP sessions (now Local)
+//   - [H1] Cached COM objects in CheckProcessRealAudio
+//   - [H2] Cached GetCurrentFullName result
+//   - [H3] Buffered log file (kept open)
+//   - [H4] Cleanup of stale map entries for disappeared processes
+//   - [H5] Fixed ExpandEnvironmentStringsW return value check
+//   - [M2] Added INI value validation
+//   - [M3] SanitizeForPath now handles leading dots
+//   - [M5] Added all forward declarations
+//   - [M6] Removed unused #include <iostream>
+//   - [L2] Magic numbers moved to named constants
+//   - [L3] COM managed via ComPtr (RAII)
 
 #include "CaptureManager.h"
 #include "ProcessEnumerator.h"
@@ -20,10 +38,10 @@
 #include <commctrl.h>
 #include <shlobj.h>
 #include <shellapi.h>
-#include <iostream>
 #include <fstream>
 #include <chrono>
 #include <thread>
+#include <mutex>
 #include <map>
 #include <set>
 #include <string>
@@ -36,6 +54,7 @@
 #include <mmdeviceapi.h>
 #include <audiopolicy.h>
 #include <endpointvolume.h>
+#include <wrl/client.h>  // [L3] ComPtr for RAII COM management
 #define SECURITY_WIN32
 #include <security.h>  // for GetUserNameExW (NameDisplay = Full Name)
 
@@ -44,9 +63,10 @@
 #pragma comment(lib, "secur32.lib")
 
 namespace fs = std::filesystem;
+using Microsoft::WRL::ComPtr;  // [L3] RAII COM pointers
 
 // ============================================================
-// Constants
+// Constants [L2] — no more magic numbers
 // ============================================================
 #define WM_TRAYICON        (WM_USER + 1)
 #define WM_SHOW_SETTINGS   (WM_USER + 2)
@@ -58,13 +78,26 @@ namespace fs = std::filesystem;
 
 static const wchar_t* WINDOW_CLASS_NAME = L"RDPCallRecorderWndClass";
 static const wchar_t* APP_TITLE = L"RDP Call Recorder";
-static const wchar_t* MUTEX_SINGLE_INSTANCE = L"Global\\RDPCallRecorder_SingleInstance";
+
+// [C5] FIX: Changed from Global to Local — per RDP session, not per server
+static const wchar_t* MUTEX_SINGLE_INSTANCE = L"Local\\RDPCallRecorder_SingleInstance";
 
 // Custom message name for IPC (second instance -> first instance)
 static UINT WM_OPEN_SETTINGS_MSG = 0;
 
 // Fake session ID for microphone capture (must not collide with real PIDs)
 static const DWORD MIC_SESSION_ID_BASE = 0xF0000000;
+
+// [L2] Named constants for magic numbers
+static const float AUDIO_PEAK_THRESHOLD = 0.01f;      // Minimum peak level to consider "real audio"
+static const int INI_BUFFER_SIZE = 1024;               // Buffer size for INI string reads
+static const int NAME_BUFFER_SIZE = 256;               // Buffer size for user name
+static const int TRAY_TIP_MAX_LEN = 128;               // Max tooltip length
+static const int LOG_TIMESTAMP_BUF = 64;               // Timestamp buffer size
+static const int SETTINGS_DLG_WIDTH = 500;
+static const int SETTINGS_DLG_HEIGHT = 420;
+static const UINT32 MIN_MP3_BITRATE = 32000;
+static const UINT32 MAX_MP3_BITRATE = 320000;
 
 // ============================================================
 // Global configuration
@@ -82,12 +115,19 @@ struct AgentConfig {
     int maxLogSizeMB = 10;
     bool hideConsole = true;
     bool useMutex = true;
-    std::wstring mutexName = L"Global\\RDPCallRecorderAgentMutex";
+    std::wstring mutexName = L"Local\\RDPCallRecorderAgentMutex";  // [C5] Local, not Global
     std::wstring processPriority = L"BelowNormal";
     bool autoRegisterStartup = true;
 };
 
 AgentConfig g_config;
+std::mutex g_configMutex;  // [C1] FIX: Thread-safe config access
+
+// Helper to safely read config fields from monitor thread
+AgentConfig GetConfigSnapshot() {
+    std::lock_guard<std::mutex> lock(g_configMutex);
+    return g_config;  // Copy
+}
 
 // ============================================================
 // Global state
@@ -111,23 +151,54 @@ enum class LogLevel {
 
 LogLevel g_logLevel = LogLevel::LOG_INFO;
 
+// [H2] FIX: Cached user names — syscall only once
+static std::wstring g_cachedFullName;
+static std::wstring g_cachedLoginName;
+static bool g_namesCached = false;
+
 // ============================================================
-// Forward declarations
+// Forward declarations [M5] — complete list
 // ============================================================
 void ShowSettingsDialog(HWND hParent);
 void MonitorThread();
 void SaveConfig();
 bool LoadConfig(AgentConfig& config);
 void Log(const std::wstring& message, LogLevel level = LogLevel::LOG_INFO);
+void RegisterAutoStart();
+void CreateTrayIcon(HWND hWnd);
+void RemoveTrayIcon();
+void UpdateTrayTooltip();
+void ShowTrayMenu(HWND hWnd);
+LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+// ============================================================
+// String conversion helper [C3] FIX: proper UTF-8 → wstring
+// ============================================================
+std::wstring Utf8ToWide(const std::string& str) {
+    if (str.empty()) return L"";
+    int needed = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), nullptr, 0);
+    if (needed <= 0) {
+        // Fallback: try ACP (system codepage)
+        needed = MultiByteToWideChar(CP_ACP, 0, str.c_str(), (int)str.size(), nullptr, 0);
+        if (needed <= 0) return L"(conversion error)";
+        std::wstring result(needed, 0);
+        MultiByteToWideChar(CP_ACP, 0, str.c_str(), (int)str.size(), &result[0], needed);
+        return result;
+    }
+    std::wstring result(needed, 0);
+    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), &result[0], needed);
+    return result;
+}
 
 // ============================================================
 // INI utilities
 // ============================================================
 std::wstring GetIniString(const std::wstring& section, const std::wstring& key,
                           const std::wstring& defaultValue, const std::wstring& iniPath) {
-    wchar_t buffer[1024];
+    wchar_t buffer[INI_BUFFER_SIZE];
     GetPrivateProfileStringW(section.c_str(), key.c_str(), defaultValue.c_str(),
-                             buffer, 1024, iniPath.c_str());
+                             buffer, INI_BUFFER_SIZE, iniPath.c_str());
     return std::wstring(buffer);
 }
 
@@ -159,7 +230,9 @@ std::vector<std::wstring> SplitString(const std::wstring& str, wchar_t delimiter
 
 std::wstring GetDefaultRecordingPath() {
     wchar_t userProfile[MAX_PATH] = { 0 };
-    if (ExpandEnvironmentStringsW(L"%USERPROFILE%\\CallRecordings", userProfile, MAX_PATH) > 0) {
+    // [H5] FIX: Check that result fits in buffer (> 0 AND <= MAX_PATH)
+    DWORD result = ExpandEnvironmentStringsW(L"%USERPROFILE%\\CallRecordings", userProfile, MAX_PATH);
+    if (result > 0 && result <= MAX_PATH) {
         return std::wstring(userProfile);
     }
     // Fallback: use LOCALAPPDATA
@@ -203,44 +276,50 @@ void SetProcessPriorityFromConfig(const std::wstring& priority) {
     SetPriorityClass(GetCurrentProcess(), priorityClass);
 }
 
-// Get user's Full Name (e.g. "Nicole" instead of "user-5")
-// Falls back to login name if Full Name is not set
+// [H2] Get user's Full Name — cached after first call
 std::wstring GetCurrentFullName() {
-    // Try to get display name (Full Name from user profile)
-    wchar_t fullName[256] = { 0 };
-    ULONG size = 256;
+    if (g_namesCached) return g_cachedFullName;
+
+    wchar_t fullName[NAME_BUFFER_SIZE] = { 0 };
+    ULONG size = NAME_BUFFER_SIZE;
     if (GetUserNameExW(NameDisplay, fullName, &size) && size > 1 && wcslen(fullName) > 0) {
-        return std::wstring(fullName);
+        g_cachedFullName = std::wstring(fullName);
+        g_namesCached = true;  // Will also cache login name below
     }
 
-    // Fallback: try NameSamCompatible and strip domain
-    size = 256;
-    if (GetUserNameExW(NameSamCompatible, fullName, &size) && size > 1) {
-        std::wstring samName(fullName);
-        // Strip domain prefix (DOMAIN\user -> user)
-        size_t pos = samName.find(L'\\');
-        if (pos != std::wstring::npos) {
-            samName = samName.substr(pos + 1);
+    if (g_cachedFullName.empty()) {
+        // Final fallback: regular login name
+        wchar_t username[NAME_BUFFER_SIZE] = { 0 };
+        DWORD usize = NAME_BUFFER_SIZE;
+        if (GetUserNameW(username, &usize)) {
+            g_cachedFullName = std::wstring(username);
+        } else {
+            g_cachedFullName = L"Unknown";
         }
-        // Don't return SAM name - we want Full Name, not login
     }
 
-    // Final fallback: regular login name
-    wchar_t username[256] = { 0 };
-    DWORD usize = 256;
-    if (GetUserNameW(username, &usize)) return std::wstring(username);
-    return L"Unknown";
+    // Cache login name too while we're at it
+    if (g_cachedLoginName.empty()) {
+        wchar_t username[NAME_BUFFER_SIZE] = { 0 };
+        DWORD usize = NAME_BUFFER_SIZE;
+        if (GetUserNameW(username, &usize)) {
+            g_cachedLoginName = std::wstring(username);
+        } else {
+            g_cachedLoginName = L"Unknown";
+        }
+    }
+    g_namesCached = true;
+    return g_cachedFullName;
 }
 
-// Get login name (for logging purposes)
+// Get login name (for logging purposes) — cached
 std::wstring GetCurrentLoginName() {
-    wchar_t username[256] = { 0 };
-    DWORD size = 256;
-    if (GetUserNameW(username, &size)) return std::wstring(username);
-    return L"Unknown";
+    if (g_namesCached) return g_cachedLoginName;
+    GetCurrentFullName();  // This caches both
+    return g_cachedLoginName;
 }
 
-// Sanitize name for use in file/folder names (remove invalid chars)
+// [M3] FIX: Sanitize name for use in file/folder names — now handles leading dots
 std::wstring SanitizeForPath(const std::wstring& name) {
     std::wstring result;
     for (wchar_t ch : name) {
@@ -252,6 +331,10 @@ std::wstring SanitizeForPath(const std::wstring& name) {
             result += ch;
         }
     }
+    // Trim leading dots (would create hidden directories on Windows)
+    while (!result.empty() && result.front() == L'.') {
+        result.erase(result.begin());
+    }
     // Trim trailing spaces/dots
     while (!result.empty() && (result.back() == L' ' || result.back() == L'.')) {
         result.pop_back();
@@ -261,7 +344,7 @@ std::wstring SanitizeForPath(const std::wstring& name) {
 }
 
 // ============================================================
-// Load / Save configuration
+// Load / Save configuration [C1] — now uses mutex
 // ============================================================
 bool LoadConfig(AgentConfig& config) {
     // Set default recording path based on user profile
@@ -272,16 +355,27 @@ bool LoadConfig(AgentConfig& config) {
     std::wstring iniPath = GetConfigPath();
     if (!fs::exists(iniPath)) return false;
 
+    std::lock_guard<std::mutex> lock(g_configMutex);
+
     config.recordingPath = GetIniString(L"Recording", L"RecordingPath", config.recordingPath, iniPath);
     config.audioFormat   = GetIniString(L"Recording", L"AudioFormat", config.audioFormat, iniPath);
-    config.mp3Bitrate    = static_cast<UINT32>(GetIniInt(L"Recording", L"MP3Bitrate", config.mp3Bitrate, iniPath));
+
+    // [M2] FIX: Validate bitrate
+    int rawBitrate = GetIniInt(L"Recording", L"MP3Bitrate", static_cast<int>(config.mp3Bitrate), iniPath);
+    if (rawBitrate >= static_cast<int>(MIN_MP3_BITRATE) && rawBitrate <= static_cast<int>(MAX_MP3_BITRATE)) {
+        config.mp3Bitrate = static_cast<UINT32>(rawBitrate);
+    }
 
     config.pollIntervalSeconds = GetIniInt(L"Monitoring", L"PollInterval", config.pollIntervalSeconds, iniPath);
     config.silenceThreshold    = GetIniInt(L"Monitoring", L"SilenceThreshold", config.silenceThreshold, iniPath);
     config.startThreshold      = GetIniInt(L"Monitoring", L"StartThreshold", config.startThreshold, iniPath);
+    // [M2] Validate ranges
     if (config.pollIntervalSeconds < 1) config.pollIntervalSeconds = 1;
+    if (config.pollIntervalSeconds > 60) config.pollIntervalSeconds = 60;
     if (config.silenceThreshold < 1) config.silenceThreshold = 1;
+    if (config.silenceThreshold > 100) config.silenceThreshold = 100;
     if (config.startThreshold < 1) config.startThreshold = 1;
+    if (config.startThreshold > 100) config.startThreshold = 100;
 
     std::wstring processesStr = GetIniString(L"Processes", L"TargetProcesses", L"WhatsApp.exe,Telegram.exe,Viber.exe", iniPath);
     auto parsed = SplitString(processesStr, L',');
@@ -290,6 +384,8 @@ bool LoadConfig(AgentConfig& config) {
     config.enableLogging = GetIniBool(L"Logging", L"EnableLogging", config.enableLogging, iniPath);
     config.logLevel      = GetIniString(L"Logging", L"LogLevel", config.logLevel, iniPath);
     config.maxLogSizeMB  = GetIniInt(L"Logging", L"MaxLogSizeMB", config.maxLogSizeMB, iniPath);
+    if (config.maxLogSizeMB < 1) config.maxLogSizeMB = 1;
+    if (config.maxLogSizeMB > 1000) config.maxLogSizeMB = 1000;
 
     config.hideConsole         = GetIniBool(L"Advanced", L"HideConsole", config.hideConsole, iniPath);
     config.useMutex            = GetIniBool(L"Advanced", L"UseMutex", config.useMutex, iniPath);
@@ -301,6 +397,8 @@ bool LoadConfig(AgentConfig& config) {
 }
 
 void SaveConfig() {
+    std::lock_guard<std::mutex> lock(g_configMutex);  // [C1]
+
     std::wstring iniPath = GetConfigPath();
 
     WritePrivateProfileStringW(L"Recording", L"RecordingPath", g_config.recordingPath.c_str(), iniPath.c_str());
@@ -360,10 +458,49 @@ void RegisterAutoStart() {
 }
 
 // ============================================================
-// Logging
+// Logging [H3] — log file kept open, flushed periodically
 // ============================================================
+static std::wofstream g_logFile;
+static std::wstring g_logFilePath;
+static std::mutex g_logMutex;
+
+void EnsureLogFileOpen(const fs::path& logDir) {
+    fs::path logFile = logDir / L"agent.log";
+    std::wstring logPath = logFile.wstring();
+
+    if (g_logFile.is_open() && g_logFilePath == logPath) {
+        // Check if rotation needed
+        try {
+            if (fs::exists(logFile)) {
+                auto config = GetConfigSnapshot();
+                auto fileSize = fs::file_size(logFile);
+                auto maxSize = static_cast<uintmax_t>(config.maxLogSizeMB) * 1024 * 1024;
+                if (fileSize > maxSize) {
+                    g_logFile.close();
+                    fs::path backupLog = logDir / L"agent.log.old";
+                    try {
+                        if (fs::exists(backupLog)) fs::remove(backupLog);
+                        fs::rename(logFile, backupLog);
+                    } catch (...) {}
+                    // Will reopen below
+                }
+            }
+        } catch (...) {}
+    }
+
+    if (!g_logFile.is_open()) {
+        try {
+            fs::create_directories(logDir);
+        } catch (...) {}
+        g_logFile.open(logPath, std::ios::app);
+        g_logFilePath = logPath;
+    }
+}
+
 void Log(const std::wstring& message, LogLevel level) {
-    if (!g_config.enableLogging) return;
+    // Read config safely
+    AgentConfig config = GetConfigSnapshot();
+    if (!config.enableLogging) return;
     if (level < g_logLevel) return;
 
     auto now = std::chrono::system_clock::now();
@@ -379,46 +516,42 @@ void Log(const std::wstring& message, LogLevel level) {
         case LogLevel::LOG_ERROR: levelStr = L"ERROR"; break;
     }
 
-    wchar_t timeStr[64];
-    swprintf_s(timeStr, 64, L"[%04d-%02d-%02d %02d:%02d:%02d]",
+    wchar_t timeStr[LOG_TIMESTAMP_BUF];
+    swprintf_s(timeStr, LOG_TIMESTAMP_BUF, L"[%04d-%02d-%02d %02d:%02d:%02d]",
         tmNow.tm_year + 1900, tmNow.tm_mon + 1, tmNow.tm_mday,
         tmNow.tm_hour, tmNow.tm_min, tmNow.tm_sec);
 
     std::wstring logLine = std::wstring(timeStr) + L" [" + levelStr + L"] " + message + L"\n";
 
-    fs::path logDir = fs::path(g_config.recordingPath) / SanitizeForPath(GetCurrentFullName()) / L"logs";
-    try {
-        fs::create_directories(logDir);
-        fs::path logFile = logDir / L"agent.log";
+    std::lock_guard<std::mutex> lock(g_logMutex);
 
-        if (fs::exists(logFile)) {
-            auto fileSize = fs::file_size(logFile);
-            auto maxSize = static_cast<uintmax_t>(g_config.maxLogSizeMB) * 1024 * 1024;
-            if (fileSize > maxSize) {
-                fs::path backupLog = logDir / L"agent.log.old";
-                try {
-                    if (fs::exists(backupLog)) fs::remove(backupLog);
-                    fs::rename(logFile, backupLog);
-                } catch (...) {
-                    std::wofstream ofs(logFile, std::ios::trunc);
-                    ofs.close();
-                }
+    fs::path logDir = fs::path(config.recordingPath) / SanitizeForPath(GetCurrentFullName()) / L"logs";
+    try {
+        EnsureLogFileOpen(logDir);
+        if (g_logFile.is_open()) {
+            g_logFile << logLine;
+            // Flush only on WARN/ERROR for performance
+            if (level >= LogLevel::LOG_WARN) {
+                g_logFile.flush();
             }
         }
-
-        std::wofstream ofs(logFile, std::ios::app);
-        if (ofs.is_open()) {
-            ofs << logLine;
-            ofs.flush();
-        }
     } catch (const std::exception&) {}
+}
+
+void CloseLogFile() {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    if (g_logFile.is_open()) {
+        g_logFile.flush();
+        g_logFile.close();
+    }
 }
 
 // ============================================================
 // Audio format helpers
 // ============================================================
 AudioFormat GetAudioFormatFromConfig() {
-    std::wstring fmt = g_config.audioFormat;
+    auto config = GetConfigSnapshot();
+    std::wstring fmt = config.audioFormat;
     std::transform(fmt.begin(), fmt.end(), fmt.begin(), ::towlower);
     if (fmt == L"wav")  return AudioFormat::WAV;
     if (fmt == L"mp3")  return AudioFormat::MP3;
@@ -460,13 +593,13 @@ std::wstring BuildOutputPath(const std::wstring& processName, AudioFormat format
         appName = appName.substr(0, dotPos);
     }
 
-    fs::path outputDir = fs::path(g_config.recordingPath) / username / dateStr;
+    auto config = GetConfigSnapshot();
+    fs::path outputDir = fs::path(config.recordingPath) / username / dateStr;
     try {
         fs::create_directories(outputDir);
     } catch (const std::exception& e) {
-        std::string errorStr = e.what();
-        std::wstring errorWstr(errorStr.begin(), errorStr.end());
-        Log(L"Failed to create directory: " + outputDir.wstring() + L" - " + errorWstr, LogLevel::LOG_ERROR);
+        // [C3] FIX: proper string conversion
+        Log(L"Failed to create directory: " + outputDir.wstring() + L" - " + Utf8ToWide(e.what()), LogLevel::LOG_ERROR);
         outputDir = fs::temp_directory_path();
     }
 
@@ -482,7 +615,7 @@ struct FoundProcess {
     std::wstring name;
 };
 
-std::vector<FoundProcess> FindTargetProcesses() {
+std::vector<FoundProcess> FindTargetProcesses(const AgentConfig& config) {
     std::vector<FoundProcess> result;
     DWORD currentSessionId = 0;
     ProcessIdToSessionId(GetCurrentProcessId(), &currentSessionId);
@@ -495,7 +628,7 @@ std::vector<FoundProcess> FindTargetProcesses() {
 
     if (Process32FirstW(hSnapshot, &pe32)) {
         do {
-            for (const auto& target : g_config.targetProcesses) {
+            for (const auto& target : config.targetProcesses) {
                 if (_wcsicmp(pe32.szExeFile, target.c_str()) == 0) {
                     DWORD processSessionId = 0;
                     ProcessIdToSessionId(pe32.th32ProcessID, &processSessionId);
@@ -514,90 +647,87 @@ std::vector<FoundProcess> FindTargetProcesses() {
 }
 
 // ============================================================
-// Check if process has REAL audio output (not just registered session)
-// Uses IAudioMeterInformation to check actual peak level.
-// Returns true only if the process is actually producing sound.
-// This prevents false triggers from:
-//   - MicroSIP audio "leaking" into Telegram's session
-//   - Idle audio sessions that are registered but silent
+// [H1] Cached audio session monitor — avoids COM re-creation every poll
 // ============================================================
-bool CheckProcessRealAudio(DWORD processId, float threshold = 0.01f) {
-    bool hasRealAudio = false;
+class AudioSessionMonitor {
+public:
+    AudioSessionMonitor() = default;
+    ~AudioSessionMonitor() = default;  // ComPtr handles Release
 
-    IMMDeviceEnumerator* deviceEnumerator = nullptr;
-    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
-        CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
-        reinterpret_cast<void**>(&deviceEnumerator));
-    if (FAILED(hr) || !deviceEnumerator) return false;
+    bool CheckProcessRealAudio(DWORD processId, float threshold = AUDIO_PEAK_THRESHOLD) {
+        // Re-initialize COM objects if needed
+        if (!EnsureInitialized()) return false;
 
-    IMMDevice* device = nullptr;
-    hr = deviceEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
-    if (FAILED(hr) || !device) {
-        deviceEnumerator->Release();
-        return false;
-    }
+        ComPtr<IAudioSessionEnumerator> sessionEnumerator;
+        HRESULT hr = m_sessionManager->GetSessionEnumerator(&sessionEnumerator);
+        if (FAILED(hr) || !sessionEnumerator) {
+            // Session manager may be stale, reset and retry next poll
+            Reset();
+            return false;
+        }
 
-    IAudioSessionManager2* sessionManager = nullptr;
-    hr = device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL,
-        nullptr, reinterpret_cast<void**>(&sessionManager));
-    if (FAILED(hr) || !sessionManager) {
-        device->Release();
-        deviceEnumerator->Release();
-        return false;
-    }
+        int sessionCount = 0;
+        sessionEnumerator->GetCount(&sessionCount);
 
-    IAudioSessionEnumerator* sessionEnumerator = nullptr;
-    hr = sessionManager->GetSessionEnumerator(&sessionEnumerator);
-    if (FAILED(hr) || !sessionEnumerator) {
-        sessionManager->Release();
-        device->Release();
-        deviceEnumerator->Release();
-        return false;
-    }
+        for (int i = 0; i < sessionCount; i++) {
+            ComPtr<IAudioSessionControl> sessionControl;
+            if (FAILED(sessionEnumerator->GetSession(i, &sessionControl)) || !sessionControl)
+                continue;
 
-    int sessionCount = 0;
-    sessionEnumerator->GetCount(&sessionCount);
-
-    for (int i = 0; i < sessionCount; i++) {
-        IAudioSessionControl* sessionControl = nullptr;
-        if (FAILED(sessionEnumerator->GetSession(i, &sessionControl)) || !sessionControl)
-            continue;
-
-        IAudioSessionControl2* sessionControl2 = nullptr;
-        if (SUCCEEDED(sessionControl->QueryInterface(__uuidof(IAudioSessionControl2),
-            reinterpret_cast<void**>(&sessionControl2)))) {
-
-            DWORD sessionProcessId = 0;
-            if (SUCCEEDED(sessionControl2->GetProcessId(&sessionProcessId))) {
-                if (sessionProcessId == processId) {
-                    // Found session for our process - check REAL audio level
-                    IAudioMeterInformation* meter = nullptr;
-                    if (SUCCEEDED(sessionControl->QueryInterface(__uuidof(IAudioMeterInformation),
-                        reinterpret_cast<void**>(&meter)))) {
-                        float peakLevel = 0.0f;
-                        if (SUCCEEDED(meter->GetPeakValue(&peakLevel))) {
-                            if (peakLevel > threshold) {
-                                hasRealAudio = true;
+            ComPtr<IAudioSessionControl2> sessionControl2;
+            if (SUCCEEDED(sessionControl.As(&sessionControl2))) {
+                DWORD sessionProcessId = 0;
+                if (SUCCEEDED(sessionControl2->GetProcessId(&sessionProcessId))) {
+                    if (sessionProcessId == processId) {
+                        ComPtr<IAudioMeterInformation> meter;
+                        if (SUCCEEDED(sessionControl.As(&meter))) {
+                            float peakLevel = 0.0f;
+                            if (SUCCEEDED(meter->GetPeakValue(&peakLevel))) {
+                                if (peakLevel > threshold) {
+                                    return true;
+                                }
                             }
                         }
-                        meter->Release();
                     }
                 }
             }
-            sessionControl2->Release();
         }
-        sessionControl->Release();
-
-        if (hasRealAudio) break;
+        return false;
     }
 
-    sessionEnumerator->Release();
-    sessionManager->Release();
-    device->Release();
-    deviceEnumerator->Release();
+    void Reset() {
+        m_sessionManager.Reset();
+        m_device.Reset();
+        m_deviceEnumerator.Reset();
+        m_initialized = false;
+    }
 
-    return hasRealAudio;
-}
+private:
+    bool EnsureInitialized() {
+        if (m_initialized && m_sessionManager) return true;
+
+        Reset();
+
+        HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
+            CLSCTX_ALL, IID_PPV_ARGS(&m_deviceEnumerator));
+        if (FAILED(hr)) return false;
+
+        hr = m_deviceEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &m_device);
+        if (FAILED(hr)) return false;
+
+        hr = m_device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL,
+            nullptr, reinterpret_cast<void**>(m_sessionManager.GetAddressOf()));
+        if (FAILED(hr)) return false;
+
+        m_initialized = true;
+        return true;
+    }
+
+    ComPtr<IMMDeviceEnumerator> m_deviceEnumerator;
+    ComPtr<IMMDevice> m_device;
+    ComPtr<IAudioSessionManager2> m_sessionManager;
+    bool m_initialized = false;
+};
 
 // ============================================================
 // Get default microphone device ID
@@ -622,14 +752,12 @@ MicInfo GetDefaultMicrophone() {
         return info;
     }
 
-    // Try to find the default device
     int defaultIdx = devEnum.GetDefaultInputDeviceIndex();
     if (defaultIdx >= 0 && defaultIdx < static_cast<int>(devices.size())) {
         info.deviceId = devices[defaultIdx].deviceId;
         info.friendlyName = devices[defaultIdx].friendlyName;
         info.found = true;
     } else {
-        // Use first available
         info.deviceId = devices[0].deviceId;
         info.friendlyName = devices[0].friendlyName;
         info.found = true;
@@ -670,6 +798,7 @@ struct CallRecordingState {
 #define IDC_AUTOSTART_CHECK 2011
 
 static HWND g_hSettingsDlg = nullptr;
+static HFONT g_hSettingsFont = nullptr;  // [C2] FIX: store font handle for cleanup
 
 void CreateLabel(HWND hParent, const wchar_t* text, int x, int y, int w, int h) {
     CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE | SS_LEFT,
@@ -708,6 +837,7 @@ HWND CreateComboBox(HWND hParent, int x, int y, int w, int h, int id) {
 }
 
 std::wstring BrowseForFolder(HWND hOwner, const std::wstring& currentPath) {
+    (void)currentPath;
     wchar_t path[MAX_PATH] = { 0 };
     BROWSEINFOW bi = {};
     bi.hwndOwner = hOwner;
@@ -727,10 +857,17 @@ std::wstring BrowseForFolder(HWND hOwner, const std::wstring& currentPath) {
 LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
-        // Set font
-        HFONT hFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        // [C2] FIX: Delete old font if any, store new one globally
+        if (g_hSettingsFont) {
+            DeleteObject(g_hSettingsFont);
+            g_hSettingsFont = nullptr;
+        }
+        g_hSettingsFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+
+        // Read config safely
+        AgentConfig config = GetConfigSnapshot();
 
         int y = 15;
         int labelX = 15;
@@ -741,9 +878,9 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 
         // Recording Path
         CreateLabel(hWnd, L"Recording folder:", labelX, y + 3, 160, 20);
-        HWND hPathEdit = CreateEditBox(hWnd, g_config.recordingPath.c_str(), editX, y, editW - 40, 24, IDC_PATH_EDIT);
+        HWND hPathEdit = CreateEditBox(hWnd, config.recordingPath.c_str(), editX, y, editW - 40, 24, IDC_PATH_EDIT);
         CreateButton(hWnd, L"...", editX + editW - 35, y, 35, 24, IDC_PATH_BROWSE);
-        SendMessageW(hPathEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendMessageW(hPathEdit, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
         y += rowH + gap;
 
         // Audio Format
@@ -751,62 +888,62 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
         HWND hCombo = CreateComboBox(hWnd, editX, y, 100, 120, IDC_FORMAT_COMBO);
         SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"mp3");
         SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"wav");
-        std::wstring fmtLower = g_config.audioFormat;
+        std::wstring fmtLower = config.audioFormat;
         std::transform(fmtLower.begin(), fmtLower.end(), fmtLower.begin(), ::towlower);
         if (fmtLower == L"wav") SendMessageW(hCombo, CB_SETCURSEL, 1, 0);
         else SendMessageW(hCombo, CB_SETCURSEL, 0, 0);
-        SendMessageW(hCombo, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendMessageW(hCombo, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
         y += rowH + gap;
 
         // MP3 Bitrate
         CreateLabel(hWnd, L"MP3 Bitrate (kbps):", labelX, y + 3, 160, 20);
-        HWND hBitrate = CreateEditBox(hWnd, std::to_wstring(g_config.mp3Bitrate / 1000).c_str(),
+        HWND hBitrate = CreateEditBox(hWnd, std::to_wstring(config.mp3Bitrate / 1000).c_str(),
             editX, y, 80, 24, IDC_BITRATE_EDIT);
-        SendMessageW(hBitrate, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendMessageW(hBitrate, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
         y += rowH + gap;
 
         // Target Processes
         std::wstring procStr;
-        for (size_t i = 0; i < g_config.targetProcesses.size(); i++) {
+        for (size_t i = 0; i < config.targetProcesses.size(); i++) {
             if (i > 0) procStr += L", ";
-            procStr += g_config.targetProcesses[i];
+            procStr += config.targetProcesses[i];
         }
         CreateLabel(hWnd, L"Target processes:", labelX, y + 3, 160, 20);
         HWND hProc = CreateEditBox(hWnd, procStr.c_str(), editX, y, editW, 24, IDC_PROCESSES_EDIT);
-        SendMessageW(hProc, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendMessageW(hProc, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
         y += rowH + gap;
 
         // Poll Interval
         CreateLabel(hWnd, L"Poll interval (sec):", labelX, y + 3, 160, 20);
-        HWND hPoll = CreateEditBox(hWnd, std::to_wstring(g_config.pollIntervalSeconds).c_str(),
+        HWND hPoll = CreateEditBox(hWnd, std::to_wstring(config.pollIntervalSeconds).c_str(),
             editX, y, 80, 24, IDC_POLL_EDIT);
-        SendMessageW(hPoll, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendMessageW(hPoll, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
         y += rowH + gap;
 
         // Silence Threshold
         CreateLabel(hWnd, L"Silence threshold:", labelX, y + 3, 160, 20);
-        HWND hSilence = CreateEditBox(hWnd, std::to_wstring(g_config.silenceThreshold).c_str(),
+        HWND hSilence = CreateEditBox(hWnd, std::to_wstring(config.silenceThreshold).c_str(),
             editX, y, 80, 24, IDC_SILENCE_EDIT);
-        SendMessageW(hSilence, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendMessageW(hSilence, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
         y += rowH + gap;
 
         // Checkboxes
-        CreateCheckBox(hWnd, L"Enable logging", labelX, y, 200, 24, IDC_LOGGING_CHECK, g_config.enableLogging);
+        CreateCheckBox(hWnd, L"Enable logging", labelX, y, 200, 24, IDC_LOGGING_CHECK, config.enableLogging);
         y += rowH;
-        CreateCheckBox(hWnd, L"Auto-start with Windows", labelX, y, 250, 24, IDC_AUTOSTART_CHECK, g_config.autoRegisterStartup);
+        CreateCheckBox(hWnd, L"Auto-start with Windows", labelX, y, 250, 24, IDC_AUTOSTART_CHECK, config.autoRegisterStartup);
         y += rowH + gap + 5;
 
         // Buttons
         HWND hSaveBtn = CreateButton(hWnd, L"Save", editX, y, 100, 30, IDC_SAVE_BTN);
         HWND hCancelBtn = CreateButton(hWnd, L"Cancel", editX + 110, y, 100, 30, IDC_CANCEL_BTN);
-        SendMessageW(hSaveBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
-        SendMessageW(hCancelBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendMessageW(hSaveBtn, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
+        SendMessageW(hCancelBtn, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
 
-        // Set font on labels
+        // Set font on all labels
         EnumChildWindows(hWnd, [](HWND hChild, LPARAM lParam) -> BOOL {
             SendMessageW(hChild, WM_SETFONT, (WPARAM)lParam, TRUE);
             return TRUE;
-        }, (LPARAM)hFont);
+        }, (LPARAM)g_hSettingsFont);
 
         return 0;
     }
@@ -815,49 +952,55 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
         int wmId = LOWORD(wParam);
 
         if (wmId == IDC_PATH_BROWSE) {
-            wchar_t currentPath[1024] = { 0 };
-            GetDlgItemTextW(hWnd, IDC_PATH_EDIT, currentPath, 1024);
+            wchar_t currentPath[INI_BUFFER_SIZE] = { 0 };
+            GetDlgItemTextW(hWnd, IDC_PATH_EDIT, currentPath, INI_BUFFER_SIZE);
             std::wstring newPath = BrowseForFolder(hWnd, currentPath);
             if (!newPath.empty()) {
                 SetDlgItemTextW(hWnd, IDC_PATH_EDIT, newPath.c_str());
             }
         }
         else if (wmId == IDC_SAVE_BTN) {
-            wchar_t buf[1024];
+            wchar_t buf[INI_BUFFER_SIZE];
 
-            GetDlgItemTextW(hWnd, IDC_PATH_EDIT, buf, 1024);
-            g_config.recordingPath = buf;
+            // [C1] Lock config for writing
+            {
+                std::lock_guard<std::mutex> lock(g_configMutex);
 
-            int sel = (int)SendDlgItemMessageW(hWnd, IDC_FORMAT_COMBO, CB_GETCURSEL, 0, 0);
-            if (sel == 1) g_config.audioFormat = L"wav";
-            else g_config.audioFormat = L"mp3";
+                GetDlgItemTextW(hWnd, IDC_PATH_EDIT, buf, INI_BUFFER_SIZE);
+                g_config.recordingPath = buf;
 
-            GetDlgItemTextW(hWnd, IDC_BITRATE_EDIT, buf, 1024);
-            int bitrate = _wtoi(buf);
-            if (bitrate > 0) g_config.mp3Bitrate = bitrate * 1000;
+                int sel = (int)SendDlgItemMessageW(hWnd, IDC_FORMAT_COMBO, CB_GETCURSEL, 0, 0);
+                if (sel == 1) g_config.audioFormat = L"wav";
+                else g_config.audioFormat = L"mp3";
 
-            GetDlgItemTextW(hWnd, IDC_PROCESSES_EDIT, buf, 1024);
-            auto parsed = SplitString(buf, L',');
-            if (!parsed.empty()) g_config.targetProcesses = parsed;
+                GetDlgItemTextW(hWnd, IDC_BITRATE_EDIT, buf, INI_BUFFER_SIZE);
+                int bitrate = _wtoi(buf);
+                if (bitrate > 0) g_config.mp3Bitrate = bitrate * 1000;
 
-            GetDlgItemTextW(hWnd, IDC_POLL_EDIT, buf, 1024);
-            int poll = _wtoi(buf);
-            if (poll >= 1) g_config.pollIntervalSeconds = poll;
+                GetDlgItemTextW(hWnd, IDC_PROCESSES_EDIT, buf, INI_BUFFER_SIZE);
+                auto parsed = SplitString(buf, L',');
+                if (!parsed.empty()) g_config.targetProcesses = parsed;
 
-            GetDlgItemTextW(hWnd, IDC_SILENCE_EDIT, buf, 1024);
-            int silence = _wtoi(buf);
-            if (silence >= 1) g_config.silenceThreshold = silence;
+                GetDlgItemTextW(hWnd, IDC_POLL_EDIT, buf, INI_BUFFER_SIZE);
+                int poll = _wtoi(buf);
+                if (poll >= 1) g_config.pollIntervalSeconds = poll;
 
-            g_config.enableLogging = (SendDlgItemMessageW(hWnd, IDC_LOGGING_CHECK, BM_GETCHECK, 0, 0) == BST_CHECKED);
-            g_config.autoRegisterStartup = (SendDlgItemMessageW(hWnd, IDC_AUTOSTART_CHECK, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                GetDlgItemTextW(hWnd, IDC_SILENCE_EDIT, buf, INI_BUFFER_SIZE);
+                int silence = _wtoi(buf);
+                if (silence >= 1) g_config.silenceThreshold = silence;
+
+                g_config.enableLogging = (SendDlgItemMessageW(hWnd, IDC_LOGGING_CHECK, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                g_config.autoRegisterStartup = (SendDlgItemMessageW(hWnd, IDC_AUTOSTART_CHECK, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            }
 
             SaveConfig();
 
+            auto config = GetConfigSnapshot();
             try {
-                fs::create_directories(g_config.recordingPath);
+                fs::create_directories(config.recordingPath);
             } catch (...) {}
 
-            Log(L"Settings saved. Recording path: " + g_config.recordingPath);
+            Log(L"Settings saved. Recording path: " + config.recordingPath);
             MessageBoxW(hWnd, L"Settings saved!", APP_TITLE, MB_OK | MB_ICONINFORMATION);
             DestroyWindow(hWnd);
         }
@@ -868,6 +1011,11 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
     }
 
     case WM_DESTROY:
+        // [C2] FIX: Clean up font handle
+        if (g_hSettingsFont) {
+            DeleteObject(g_hSettingsFont);
+            g_hSettingsFont = nullptr;
+        }
         g_hSettingsDlg = nullptr;
         return 0;
 
@@ -880,6 +1028,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 }
 
 void ShowSettingsDialog(HWND hParent) {
+    (void)hParent;
     if (g_hSettingsDlg != nullptr) {
         SetForegroundWindow(g_hSettingsDlg);
         return;
@@ -898,8 +1047,6 @@ void ShowSettingsDialog(HWND hParent) {
         classRegistered = true;
     }
 
-    int dlgW = 500;
-    int dlgH = 420;
     int screenW = GetSystemMetrics(SM_CXSCREEN);
     int screenH = GetSystemMetrics(SM_CYSCREEN);
 
@@ -908,8 +1055,8 @@ void ShowSettingsDialog(HWND hParent) {
         L"RDPCallRecorderSettingsClass",
         L"RDP Call Recorder - Settings",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-        (screenW - dlgW) / 2, (screenH - dlgH) / 2,
-        dlgW, dlgH,
+        (screenW - SETTINGS_DLG_WIDTH) / 2, (screenH - SETTINGS_DLG_HEIGHT) / 2,
+        SETTINGS_DLG_WIDTH, SETTINGS_DLG_HEIGHT,
         nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
 
     ShowWindow(g_hSettingsDlg, SW_SHOW);
@@ -935,7 +1082,7 @@ void CreateTrayIcon(HWND hWnd) {
 void UpdateTrayTooltip() {
     int count = g_activeRecordings.load();
     if (count > 0) {
-        swprintf_s(g_nid.szTip, 128, L"RDP Call Recorder - Recording (%d active)", count);
+        swprintf_s(g_nid.szTip, TRAY_TIP_MAX_LEN, L"RDP Call Recorder - Recording (%d active)", count);
     } else {
         wcscpy_s(g_nid.szTip, L"RDP Call Recorder - Monitoring...");
     }
@@ -996,9 +1143,11 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         case IDM_SETTINGS:
             ShowSettingsDialog(hWnd);
             break;
-        case IDM_OPEN_FOLDER:
-            ShellExecuteW(nullptr, L"open", g_config.recordingPath.c_str(), nullptr, nullptr, SW_SHOW);
+        case IDM_OPEN_FOLDER: {
+            auto config = GetConfigSnapshot();
+            ShellExecuteW(nullptr, L"open", config.recordingPath.c_str(), nullptr, nullptr, SW_SHOW);
             break;
+        }
         case IDM_EXIT:
             g_running = false;
             RemoveTrayIcon();
@@ -1025,6 +1174,8 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 //   3. Start microphone capture (caller voice) - monitorOnly
 //   4. Enable mixed recording -> one output file with both voices
 //   5. On call end: disable mixed, stop all captures
+//
+// [C4] FIX: Track active mixed recording count to handle simultaneous calls
 // ============================================================
 void MonitorThread() {
     // Initialize WinRT/COM in this thread
@@ -1037,38 +1188,42 @@ void MonitorThread() {
     ProcessEnumerator processEnum;
     AudioFormat audioFormat = GetAudioFormatFromConfig();
 
+    // [H1] Cached audio session monitor
+    AudioSessionMonitor audioMonitor;
+
     // Track recording state per process
     std::map<DWORD, CallRecordingState> callState;
     std::map<DWORD, int> silenceCounter;
-    std::map<DWORD, int> startCounter;  // How many consecutive polls with REAL audio before starting
+    std::map<DWORD, int> startCounter;
     DWORD nextMicSessionId = MIC_SESSION_ID_BASE;
+
+    // [C4] FIX: Count of active mixed recordings
+    int activeMixedCount = 0;
 
     while (g_running) {
         try {
             // Re-read format in case settings changed
             audioFormat = GetAudioFormatFromConfig();
+            AgentConfig config = GetConfigSnapshot();
 
-            std::vector<FoundProcess> targetProcs = FindTargetProcesses();
+            std::vector<FoundProcess> targetProcs = FindTargetProcesses(config);
             std::set<DWORD> currentPids;
 
             for (size_t i = 0; i < targetProcs.size(); i++) {
                 DWORD pid = targetProcs[i].pid;
                 std::wstring name = targetProcs[i].name;
                 currentPids.insert(pid);
-                // Use CheckProcessRealAudio instead of CheckProcessHasActiveAudio
-                // This checks actual peak audio level, not just session state.
-                // Prevents false triggers from MicroSIP or other apps.
-                bool hasRealAudio = CheckProcessRealAudio(pid);
+
+                bool hasRealAudio = audioMonitor.CheckProcessRealAudio(pid);
 
                 if (hasRealAudio && !callState[pid].isRecording) {
                     // ---- AUDIO DETECTED, CHECK START THRESHOLD ----
                     startCounter[pid]++;
                     Log(L"Audio detected: " + name + L" PID=" + std::to_wstring(pid) +
                         L" count=" + std::to_wstring(startCounter[pid]) +
-                        L"/" + std::to_wstring(g_config.startThreshold), LogLevel::LOG_DEBUG);
+                        L"/" + std::to_wstring(config.startThreshold), LogLevel::LOG_DEBUG);
 
-                    if (startCounter[pid] < g_config.startThreshold) {
-                        // Not enough consecutive polls yet - could be just a notification
+                    if (startCounter[pid] < config.startThreshold) {
                         continue;
                     }
 
@@ -1077,7 +1232,6 @@ void MonitorThread() {
                     silenceCounter[pid] = 0;
                     std::wstring outputPath = BuildOutputPath(name, audioFormat);
 
-                    // Assign a unique mic session ID for this call
                     DWORD micSessId = nextMicSessionId++;
                     if (nextMicSessionId >= 0xFFFFFFFF) {
                         nextMicSessionId = MIC_SESSION_ID_BASE;
@@ -1086,7 +1240,7 @@ void MonitorThread() {
                     // Step 1: Start process audio capture (callee voice) - monitorOnly
                     bool procStarted = captureManager.StartCapture(
                         pid, name, outputPath, audioFormat,
-                        g_config.mp3Bitrate, false, L"", true);
+                        config.mp3Bitrate, false, L"", true);
 
                     if (!procStarted) {
                         Log(L"REC FAIL (process capture): " + name + L" PID=" + std::to_wstring(pid), LogLevel::LOG_ERROR);
@@ -1101,7 +1255,7 @@ void MonitorThread() {
                         micStarted = captureManager.StartCaptureFromDevice(
                             micSessId, mic.friendlyName, mic.deviceId, true,
                             outputPath, audioFormat,
-                            g_config.mp3Bitrate, false, true);
+                            config.mp3Bitrate, false, true);
                         if (micStarted) {
                             Log(L"Microphone capture started: " + mic.friendlyName, LogLevel::LOG_DEBUG);
                         } else {
@@ -1113,25 +1267,23 @@ void MonitorThread() {
 
                     // Step 3: Enable mixed recording -> one output file
                     bool mixedOk = captureManager.EnableMixedRecording(
-                        outputPath, audioFormat, g_config.mp3Bitrate);
+                        outputPath, audioFormat, config.mp3Bitrate);
 
                     if (!mixedOk) {
                         // Fallback: mixed recording failed, try direct capture instead
                         Log(L"Mixed recording failed, falling back to process-only capture", LogLevel::LOG_WARN);
-                        // Stop monitorOnly captures
                         captureManager.StopCapture(pid);
                         if (micStarted) captureManager.StopCapture(micSessId);
 
-                        // Restart process capture with actual file output
                         bool directStarted = captureManager.StartCapture(
                             pid, name, outputPath, audioFormat,
-                            g_config.mp3Bitrate, false, L"", false);
+                            config.mp3Bitrate, false, L"", false);
 
                         if (!directStarted) {
                             Log(L"REC FAIL (direct fallback): " + name + L" PID=" + std::to_wstring(pid), LogLevel::LOG_ERROR);
                             continue;
                         }
-                        micSessId = 0; // no mic session
+                        micSessId = 0;
                     }
 
                     callState[pid].isRecording = true;
@@ -1143,6 +1295,7 @@ void MonitorThread() {
                     g_activeRecordings++;
 
                     if (mixedOk) {
+                        activeMixedCount++;  // [C4]
                         Log(L"REC START (mixed): " + name + L" PID=" + std::to_wstring(pid) + L" -> " + outputPath);
                     } else {
                         Log(L"REC START (process-only): " + name + L" PID=" + std::to_wstring(pid) + L" -> " + outputPath);
@@ -1156,13 +1309,17 @@ void MonitorThread() {
                 } else if (!hasRealAudio && callState[pid].isRecording) {
                     // ---- SILENCE DETECTED ----
                     silenceCounter[pid]++;
-                    if (silenceCounter[pid] >= g_config.silenceThreshold) {
+                    if (silenceCounter[pid] >= config.silenceThreshold) {
                         // ---- CALL ENDED ----
                         CallRecordingState& cs = callState[pid];
 
-                        // Stop mixed recording first
+                        // [C4] FIX: Only disable mixed recording if this is the LAST active mixed recording
                         if (cs.mixedEnabled) {
-                            captureManager.DisableMixedRecording();
+                            activeMixedCount--;
+                            if (activeMixedCount <= 0) {
+                                captureManager.DisableMixedRecording();
+                                activeMixedCount = 0;
+                            }
                         }
 
                         // Stop microphone capture
@@ -1194,40 +1351,47 @@ void MonitorThread() {
             for (auto it = callState.begin(); it != callState.end(); ++it) {
                 DWORD pid = it->first;
                 CallRecordingState& cs = it->second;
-                if (cs.isRecording && currentPids.find(pid) == currentPids.end()) {
-                    // Process exited while recording
-                    if (cs.mixedEnabled) {
-                        captureManager.DisableMixedRecording();
-                    }
-                    if (cs.micSessionId != 0) {
-                        captureManager.StopCapture(cs.micSessionId);
-                    }
-                    captureManager.StopCapture(pid);
+                if (currentPids.find(pid) == currentPids.end()) {
+                    if (cs.isRecording) {
+                        // Process exited while recording
+                        if (cs.mixedEnabled) {
+                            activeMixedCount--;  // [C4]
+                            if (activeMixedCount <= 0) {
+                                captureManager.DisableMixedRecording();
+                                activeMixedCount = 0;
+                            }
+                        }
+                        if (cs.micSessionId != 0) {
+                            captureManager.StopCapture(cs.micSessionId);
+                        }
+                        captureManager.StopCapture(pid);
 
-                    Log(L"REC STOP (process exited): " + cs.processName + L" PID=" + std::to_wstring(pid), LogLevel::LOG_WARN);
-                    cs.isRecording = false;
-                    g_activeRecordings--;
+                        Log(L"REC STOP (process exited): " + cs.processName + L" PID=" + std::to_wstring(pid), LogLevel::LOG_WARN);
+                        cs.isRecording = false;
+                        g_activeRecordings--;
+                    }
+                    // [H4] FIX: Remove ALL stale entries, not just actively recording ones
                     toRemove.push_back(pid);
                 }
             }
-            for (size_t i = 0; i < toRemove.size(); i++) {
-                callState.erase(toRemove[i]);
-                silenceCounter.erase(toRemove[i]);
-                startCounter.erase(toRemove[i]);
+            for (DWORD removePid : toRemove) {
+                callState.erase(removePid);
+                silenceCounter.erase(removePid);
+                startCounter.erase(removePid);
             }
 
             UpdateTrayTooltip();
 
         } catch (const std::exception& e) {
-            std::string es = e.what();
-            std::wstring wes(es.begin(), es.end());
-            Log(L"Exception: " + wes, LogLevel::LOG_ERROR);
+            // [C3] FIX: proper string conversion
+            Log(L"Exception: " + Utf8ToWide(e.what()), LogLevel::LOG_ERROR);
         } catch (...) {
             Log(L"Unknown exception", LogLevel::LOG_ERROR);
         }
 
         // Sleep in small intervals so we can stop quickly
-        for (int i = 0; i < g_config.pollIntervalSeconds * 10 && g_running; i++) {
+        AgentConfig config = GetConfigSnapshot();
+        for (int i = 0; i < config.pollIntervalSeconds * 10 && g_running; i++) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
@@ -1243,7 +1407,6 @@ void MonitorThread() {
 bool IsFirstLaunch() {
     std::wstring iniPath = GetConfigPath();
     if (!fs::exists(iniPath)) return true;
-    // Check if config has been saved at least once by looking for a marker
     std::wstring marker = GetIniString(L"Advanced", L"Configured", L"false", iniPath);
     std::transform(marker.begin(), marker.end(), marker.begin(), ::towlower);
     return (marker != L"true" && marker != L"1" && marker != L"yes");
@@ -1258,7 +1421,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Register custom message for IPC
     WM_OPEN_SETTINGS_MSG = RegisterWindowMessageW(L"RDPCallRecorder_OpenSettings");
 
-    // Check if already running - if so, send message to open settings
+    // [C5] Check if already running — Local mutex, per-session
     HANDLE hMutexSingle = CreateMutexW(nullptr, FALSE, MUTEX_SINGLE_INSTANCE);
     if (hMutexSingle != nullptr && GetLastError() == ERROR_ALREADY_EXISTS) {
         PostMessageW(HWND_BROADCAST, WM_OPEN_SETTINGS_MSG, 0, 0);
@@ -1303,9 +1466,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     CreateTrayIcon(g_hWndMain);
 
     // Log startup
-    Log(L"=== RDP Call Recorder Agent v2.4 started ===");
+    Log(L"=== RDP Call Recorder Agent v2.5 started ===");
     Log(L"User: " + GetCurrentFullName() + L" (login: " + GetCurrentLoginName() + L")");
-    Log(L"Recording path: " + g_config.recordingPath);
+    Log(L"Recording path: " + GetConfigSnapshot().recordingPath);
     Log(L"Mode: Mixed recording (both voices)");
 
     // If first launch - show settings dialog
@@ -1332,6 +1495,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         g_monitorThread.join();
     }
     RemoveTrayIcon();
+    CloseLogFile();  // [H3] Close buffered log file
     if (hMutexSingle) CloseHandle(hMutexSingle);
     if (g_hMutex) CloseHandle(g_hMutex);
     CoUninitialize();
