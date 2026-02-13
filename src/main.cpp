@@ -703,51 +703,78 @@ bool IsChildOfProcess(DWORD childPid, DWORD parentPid) {
 }
 
 // ============================================================
-// [H1] Cached audio session monitor — avoids COM re-creation every poll
+// [H1] Multi-device audio session monitor
+// Enumerates ALL active audio devices (render + capture) to find
+// audio sessions. This fixes Viber detection — Viber may create
+// audio sessions on non-default devices or use child processes.
+// Approach borrowed from Desktop Call Recorder.
 // ============================================================
 class AudioSessionMonitor {
 public:
     AudioSessionMonitor() = default;
-    ~AudioSessionMonitor() = default;  // ComPtr handles Release
+    ~AudioSessionMonitor() = default;
 
-    // Check if a process (or any of its child processes) has real audio output
+    // Check if a process (or any of its child processes) has real audio on ANY device
     bool CheckProcessRealAudio(DWORD processId, float threshold = AUDIO_PEAK_THRESHOLD) {
-        // Re-initialize COM objects if needed
-        if (!EnsureInitialized()) return false;
+        if (!EnsureEnumeratorInitialized()) return false;
 
-        ComPtr<IAudioSessionEnumerator> sessionEnumerator;
-        HRESULT hr = m_sessionManager->GetSessionEnumerator(&sessionEnumerator);
-        if (FAILED(hr) || !sessionEnumerator) {
-            // Session manager may be stale, reset and retry next poll
-            Reset();
-            return false;
-        }
+        // Check across ALL active render devices
+        ComPtr<IMMDeviceCollection> deviceCollection;
+        HRESULT hr = m_deviceEnumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &deviceCollection);
+        if (FAILED(hr) || !deviceCollection) return false;
 
-        int sessionCount = 0;
-        sessionEnumerator->GetCount(&sessionCount);
+        UINT deviceCount = 0;
+        deviceCollection->GetCount(&deviceCount);
 
-        for (int i = 0; i < sessionCount; i++) {
-            ComPtr<IAudioSessionControl> sessionControl;
-            if (FAILED(sessionEnumerator->GetSession(i, &sessionControl)) || !sessionControl)
-                continue;
+        for (UINT d = 0; d < deviceCount; d++) {
+            ComPtr<IMMDevice> device;
+            if (FAILED(deviceCollection->Item(d, &device)) || !device) continue;
 
-            ComPtr<IAudioSessionControl2> sessionControl2;
-            if (SUCCEEDED(sessionControl.As(&sessionControl2))) {
-                DWORD sessionProcessId = 0;
-                if (SUCCEEDED(sessionControl2->GetProcessId(&sessionProcessId))) {
-                    // Match directly OR via parent process (for apps like Viber that use child processes for audio)
-                    bool isMatch = (sessionProcessId == processId);
-                    if (!isMatch && sessionProcessId != 0) {
-                        isMatch = IsChildOfProcess(sessionProcessId, processId);
-                    }
+            ComPtr<IAudioSessionManager2> sessionManager;
+            hr = device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL,
+                nullptr, reinterpret_cast<void**>(sessionManager.GetAddressOf()));
+            if (FAILED(hr) || !sessionManager) continue;
 
-                    if (isMatch) {
-                        ComPtr<IAudioMeterInformation> meter;
-                        if (SUCCEEDED(sessionControl.As(&meter))) {
-                            float peakLevel = 0.0f;
-                            if (SUCCEEDED(meter->GetPeakValue(&peakLevel))) {
-                                if (peakLevel > threshold) {
-                                    return true;
+            ComPtr<IAudioSessionEnumerator> sessionEnumerator;
+            hr = sessionManager->GetSessionEnumerator(&sessionEnumerator);
+            if (FAILED(hr) || !sessionEnumerator) continue;
+
+            int sessionCount = 0;
+            sessionEnumerator->GetCount(&sessionCount);
+
+            for (int i = 0; i < sessionCount; i++) {
+                ComPtr<IAudioSessionControl> sessionControl;
+                if (FAILED(sessionEnumerator->GetSession(i, &sessionControl)) || !sessionControl)
+                    continue;
+
+                ComPtr<IAudioSessionControl2> sessionControl2;
+                if (SUCCEEDED(sessionControl.As(&sessionControl2))) {
+                    DWORD sessionProcessId = 0;
+                    if (SUCCEEDED(sessionControl2->GetProcessId(&sessionProcessId))) {
+                        bool isMatch = (sessionProcessId == processId);
+                        if (!isMatch && sessionProcessId != 0) {
+                            isMatch = IsChildOfProcess(sessionProcessId, processId);
+                        }
+                        // Also check reverse: is the target process a child of the session process?
+                        if (!isMatch && sessionProcessId != 0) {
+                            std::wstring sessionProcName = GetProcessNameByPid(sessionProcessId);
+                            // Check if session process name matches any target
+                            for (const auto& target : GetConfigSnapshot().targetProcesses) {
+                                if (_wcsicmp(sessionProcName.c_str(), target.c_str()) == 0) {
+                                    isMatch = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (isMatch) {
+                            ComPtr<IAudioMeterInformation> meter;
+                            if (SUCCEEDED(sessionControl.As(&meter))) {
+                                float peakLevel = 0.0f;
+                                if (SUCCEEDED(meter->GetPeakValue(&peakLevel))) {
+                                    if (peakLevel > threshold) {
+                                        return true;
+                                    }
                                 }
                             }
                         }
@@ -758,68 +785,186 @@ public:
         return false;
     }
 
-    // Dump all active audio sessions for diagnostic purposes
-    void DumpAudioSessions() {
-        if (!EnsureInitialized()) {
-            Log(L"[DIAG] Cannot enumerate audio sessions: COM init failed", LogLevel::LOG_DEBUG);
-            return;
-        }
+    // Also check ALL audio sessions and return matching target process info
+    // This is the "reverse" approach: enumerate sessions first, then match to targets
+    struct DetectedSession {
+        DWORD pid;
+        std::wstring processName;
+        std::wstring parentName;
+        DWORD parentPid;
+        float peakLevel;
+    };
 
-        ComPtr<IAudioSessionEnumerator> sessionEnumerator;
-        HRESULT hr = m_sessionManager->GetSessionEnumerator(&sessionEnumerator);
-        if (FAILED(hr) || !sessionEnumerator) {
-            Log(L"[DIAG] Cannot get session enumerator", LogLevel::LOG_DEBUG);
-            return;
-        }
+    std::vector<DetectedSession> FindActiveTargetSessions(const std::vector<std::wstring>& targetNames, float threshold = AUDIO_PEAK_THRESHOLD) {
+        std::vector<DetectedSession> result;
+        if (!EnsureEnumeratorInitialized()) return result;
 
-        int sessionCount = 0;
-        sessionEnumerator->GetCount(&sessionCount);
-        Log(L"[DIAG] Total audio sessions on default render device: " + std::to_wstring(sessionCount), LogLevel::LOG_DEBUG);
+        ComPtr<IMMDeviceCollection> deviceCollection;
+        HRESULT hr = m_deviceEnumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &deviceCollection);
+        if (FAILED(hr) || !deviceCollection) return result;
 
-        for (int i = 0; i < sessionCount; i++) {
-            ComPtr<IAudioSessionControl> sessionControl;
-            if (FAILED(sessionEnumerator->GetSession(i, &sessionControl)) || !sessionControl)
-                continue;
+        UINT deviceCount = 0;
+        deviceCollection->GetCount(&deviceCount);
 
-            ComPtr<IAudioSessionControl2> sessionControl2;
-            if (SUCCEEDED(sessionControl.As(&sessionControl2))) {
+        for (UINT d = 0; d < deviceCount; d++) {
+            ComPtr<IMMDevice> device;
+            if (FAILED(deviceCollection->Item(d, &device)) || !device) continue;
+
+            ComPtr<IAudioSessionManager2> sessionManager;
+            hr = device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL,
+                nullptr, reinterpret_cast<void**>(sessionManager.GetAddressOf()));
+            if (FAILED(hr) || !sessionManager) continue;
+
+            ComPtr<IAudioSessionEnumerator> sessionEnumerator;
+            hr = sessionManager->GetSessionEnumerator(&sessionEnumerator);
+            if (FAILED(hr) || !sessionEnumerator) continue;
+
+            int sessionCount = 0;
+            sessionEnumerator->GetCount(&sessionCount);
+
+            for (int i = 0; i < sessionCount; i++) {
+                ComPtr<IAudioSessionControl> sessionControl;
+                if (FAILED(sessionEnumerator->GetSession(i, &sessionControl)) || !sessionControl)
+                    continue;
+
+                ComPtr<IAudioSessionControl2> sessionControl2;
+                if (!SUCCEEDED(sessionControl.As(&sessionControl2))) continue;
+
                 DWORD sessionPid = 0;
-                sessionControl2->GetProcessId(&sessionPid);
+                if (!SUCCEEDED(sessionControl2->GetProcessId(&sessionPid)) || sessionPid == 0) continue;
 
-                // Get process name from PID
-                std::wstring procName = GetProcessNameByPid(sessionPid);
-
-                // Get peak level
                 float peakLevel = 0.0f;
                 ComPtr<IAudioMeterInformation> meter;
                 if (SUCCEEDED(sessionControl.As(&meter))) {
                     meter->GetPeakValue(&peakLevel);
                 }
 
-                // Get parent PID
-                DWORD parentPid = GetParentProcessId(sessionPid);
-                std::wstring parentName = (parentPid != 0) ? GetProcessNameByPid(parentPid) : L"(none)";
+                if (peakLevel <= threshold) continue;
 
-                Log(L"[DIAG] Session " + std::to_wstring(i) +
-                    L": PID=" + std::to_wstring(sessionPid) +
-                    L" Name=" + procName +
-                    L" ParentPID=" + std::to_wstring(parentPid) +
-                    L" ParentName=" + parentName +
-                    L" Peak=" + std::to_wstring(peakLevel), LogLevel::LOG_DEBUG);
+                // Get process name and check against targets (including parent chain)
+                std::wstring procName = GetProcessNameByPid(sessionPid);
+                DWORD parentPid = GetParentProcessId(sessionPid);
+                std::wstring parentName = (parentPid != 0) ? GetProcessNameByPid(parentPid) : L"";
+
+                bool matched = false;
+                for (const auto& target : targetNames) {
+                    if (_wcsicmp(procName.c_str(), target.c_str()) == 0) {
+                        matched = true;
+                        break;
+                    }
+                    if (_wcsicmp(parentName.c_str(), target.c_str()) == 0) {
+                        matched = true;
+                        break;
+                    }
+                    // Check grandparent too
+                    if (parentPid != 0) {
+                        DWORD grandparentPid = GetParentProcessId(parentPid);
+                        if (grandparentPid != 0) {
+                            std::wstring gpName = GetProcessNameByPid(grandparentPid);
+                            if (_wcsicmp(gpName.c_str(), target.c_str()) == 0) {
+                                matched = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (matched) {
+                    DetectedSession ds;
+                    ds.pid = sessionPid;
+                    ds.processName = procName;
+                    ds.parentName = parentName;
+                    ds.parentPid = parentPid;
+                    ds.peakLevel = peakLevel;
+                    result.push_back(ds);
+                }
+            }
+        }
+        return result;
+    }
+
+    // Dump all active audio sessions across ALL devices for diagnostics
+    void DumpAudioSessions() {
+        if (!EnsureEnumeratorInitialized()) {
+            Log(L"[DIAG] Cannot enumerate audio sessions: COM init failed", LogLevel::LOG_DEBUG);
+            return;
+        }
+
+        ComPtr<IMMDeviceCollection> deviceCollection;
+        HRESULT hr = m_deviceEnumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &deviceCollection);
+        if (FAILED(hr) || !deviceCollection) {
+            Log(L"[DIAG] Cannot enumerate render devices", LogLevel::LOG_DEBUG);
+            return;
+        }
+
+        UINT deviceCount = 0;
+        deviceCollection->GetCount(&deviceCount);
+        Log(L"[DIAG] Active render devices: " + std::to_wstring(deviceCount), LogLevel::LOG_DEBUG);
+
+        for (UINT d = 0; d < deviceCount; d++) {
+            ComPtr<IMMDevice> device;
+            if (FAILED(deviceCollection->Item(d, &device)) || !device) continue;
+
+            // Get device ID for logging
+            LPWSTR deviceId = nullptr;
+            device->GetId(&deviceId);
+            std::wstring devIdStr = deviceId ? deviceId : L"(unknown)";
+            if (deviceId) CoTaskMemFree(deviceId);
+
+            ComPtr<IAudioSessionManager2> sessionManager;
+            hr = device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL,
+                nullptr, reinterpret_cast<void**>(sessionManager.GetAddressOf()));
+            if (FAILED(hr) || !sessionManager) continue;
+
+            ComPtr<IAudioSessionEnumerator> sessionEnumerator;
+            hr = sessionManager->GetSessionEnumerator(&sessionEnumerator);
+            if (FAILED(hr) || !sessionEnumerator) continue;
+
+            int sessionCount = 0;
+            sessionEnumerator->GetCount(&sessionCount);
+            Log(L"[DIAG] Device " + std::to_wstring(d) + L" (" + devIdStr.substr(0, 40) + L"): " +
+                std::to_wstring(sessionCount) + L" sessions", LogLevel::LOG_DEBUG);
+
+            for (int i = 0; i < sessionCount; i++) {
+                ComPtr<IAudioSessionControl> sessionControl;
+                if (FAILED(sessionEnumerator->GetSession(i, &sessionControl)) || !sessionControl)
+                    continue;
+
+                ComPtr<IAudioSessionControl2> sessionControl2;
+                if (SUCCEEDED(sessionControl.As(&sessionControl2))) {
+                    DWORD sessionPid = 0;
+                    sessionControl2->GetProcessId(&sessionPid);
+
+                    std::wstring procName = GetProcessNameByPid(sessionPid);
+
+                    float peakLevel = 0.0f;
+                    ComPtr<IAudioMeterInformation> meter;
+                    if (SUCCEEDED(sessionControl.As(&meter))) {
+                        meter->GetPeakValue(&peakLevel);
+                    }
+
+                    DWORD parentPid = GetParentProcessId(sessionPid);
+                    std::wstring parentName = (parentPid != 0) ? GetProcessNameByPid(parentPid) : L"(none)";
+
+                    Log(L"[DIAG] Dev" + std::to_wstring(d) + L" Sess" + std::to_wstring(i) +
+                        L": PID=" + std::to_wstring(sessionPid) +
+                        L" Name=" + procName +
+                        L" ParentPID=" + std::to_wstring(parentPid) +
+                        L" ParentName=" + parentName +
+                        L" Peak=" + std::to_wstring(peakLevel), LogLevel::LOG_DEBUG);
+                }
             }
         }
     }
 
     void Reset() {
-        m_sessionManager.Reset();
-        m_device.Reset();
         m_deviceEnumerator.Reset();
         m_initialized = false;
     }
 
 private:
-    bool EnsureInitialized() {
-        if (m_initialized && m_sessionManager) return true;
+    bool EnsureEnumeratorInitialized() {
+        if (m_initialized && m_deviceEnumerator) return true;
 
         Reset();
 
@@ -827,20 +972,11 @@ private:
             CLSCTX_ALL, IID_PPV_ARGS(&m_deviceEnumerator));
         if (FAILED(hr)) return false;
 
-        hr = m_deviceEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &m_device);
-        if (FAILED(hr)) return false;
-
-        hr = m_device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL,
-            nullptr, reinterpret_cast<void**>(m_sessionManager.GetAddressOf()));
-        if (FAILED(hr)) return false;
-
         m_initialized = true;
         return true;
     }
 
     ComPtr<IMMDeviceEnumerator> m_deviceEnumerator;
-    ComPtr<IMMDevice> m_device;
-    ComPtr<IAudioSessionManager2> m_sessionManager;
     bool m_initialized = false;
 };
 
