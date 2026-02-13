@@ -165,6 +165,9 @@ void SaveConfig();
 bool LoadConfig(AgentConfig& config);
 void Log(const std::wstring& message, LogLevel level = LogLevel::LOG_INFO);
 void RegisterAutoStart();
+std::wstring GetProcessNameByPid(DWORD pid);
+DWORD GetParentProcessId(DWORD pid);
+bool IsChildOfProcess(DWORD childPid, DWORD parentPid);
 void CreateTrayIcon(HWND hWnd);
 void RemoveTrayIcon();
 void UpdateTrayTooltip();
@@ -647,6 +650,59 @@ std::vector<FoundProcess> FindTargetProcesses(const AgentConfig& config) {
 }
 
 // ============================================================
+// Process tree helpers (for child-process audio detection)
+// ============================================================
+std::wstring GetProcessNameByPid(DWORD pid) {
+    if (pid == 0) return L"(system)";
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return L"(unknown)";
+    PROCESSENTRY32W pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
+    std::wstring result = L"(unknown)";
+    if (Process32FirstW(hSnapshot, &pe32)) {
+        do {
+            if (pe32.th32ProcessID == pid) {
+                result = pe32.szExeFile;
+                break;
+            }
+        } while (Process32NextW(hSnapshot, &pe32));
+    }
+    CloseHandle(hSnapshot);
+    return result;
+}
+
+DWORD GetParentProcessId(DWORD pid) {
+    if (pid == 0) return 0;
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
+    DWORD parentPid = 0;
+    if (Process32FirstW(hSnapshot, &pe32)) {
+        do {
+            if (pe32.th32ProcessID == pid) {
+                parentPid = pe32.th32ParentProcessID;
+                break;
+            }
+        } while (Process32NextW(hSnapshot, &pe32));
+    }
+    CloseHandle(hSnapshot);
+    return parentPid;
+}
+
+// Check if childPid is a child (or grandchild, up to 3 levels) of parentPid
+bool IsChildOfProcess(DWORD childPid, DWORD parentPid) {
+    DWORD current = childPid;
+    for (int depth = 0; depth < 3; depth++) {
+        DWORD parent = GetParentProcessId(current);
+        if (parent == 0 || parent == current) return false;
+        if (parent == parentPid) return true;
+        current = parent;
+    }
+    return false;
+}
+
+// ============================================================
 // [H1] Cached audio session monitor — avoids COM re-creation every poll
 // ============================================================
 class AudioSessionMonitor {
@@ -654,6 +710,7 @@ public:
     AudioSessionMonitor() = default;
     ~AudioSessionMonitor() = default;  // ComPtr handles Release
 
+    // Check if a process (or any of its child processes) has real audio output
     bool CheckProcessRealAudio(DWORD processId, float threshold = AUDIO_PEAK_THRESHOLD) {
         // Re-initialize COM objects if needed
         if (!EnsureInitialized()) return false;
@@ -678,7 +735,13 @@ public:
             if (SUCCEEDED(sessionControl.As(&sessionControl2))) {
                 DWORD sessionProcessId = 0;
                 if (SUCCEEDED(sessionControl2->GetProcessId(&sessionProcessId))) {
-                    if (sessionProcessId == processId) {
+                    // Match directly OR via parent process (for apps like Viber that use child processes for audio)
+                    bool isMatch = (sessionProcessId == processId);
+                    if (!isMatch && sessionProcessId != 0) {
+                        isMatch = IsChildOfProcess(sessionProcessId, processId);
+                    }
+
+                    if (isMatch) {
                         ComPtr<IAudioMeterInformation> meter;
                         if (SUCCEEDED(sessionControl.As(&meter))) {
                             float peakLevel = 0.0f;
@@ -693,6 +756,58 @@ public:
             }
         }
         return false;
+    }
+
+    // Dump all active audio sessions for diagnostic purposes
+    void DumpAudioSessions() {
+        if (!EnsureInitialized()) {
+            Log(L"[DIAG] Cannot enumerate audio sessions: COM init failed", LogLevel::LOG_DEBUG);
+            return;
+        }
+
+        ComPtr<IAudioSessionEnumerator> sessionEnumerator;
+        HRESULT hr = m_sessionManager->GetSessionEnumerator(&sessionEnumerator);
+        if (FAILED(hr) || !sessionEnumerator) {
+            Log(L"[DIAG] Cannot get session enumerator", LogLevel::LOG_DEBUG);
+            return;
+        }
+
+        int sessionCount = 0;
+        sessionEnumerator->GetCount(&sessionCount);
+        Log(L"[DIAG] Total audio sessions on default render device: " + std::to_wstring(sessionCount), LogLevel::LOG_DEBUG);
+
+        for (int i = 0; i < sessionCount; i++) {
+            ComPtr<IAudioSessionControl> sessionControl;
+            if (FAILED(sessionEnumerator->GetSession(i, &sessionControl)) || !sessionControl)
+                continue;
+
+            ComPtr<IAudioSessionControl2> sessionControl2;
+            if (SUCCEEDED(sessionControl.As(&sessionControl2))) {
+                DWORD sessionPid = 0;
+                sessionControl2->GetProcessId(&sessionPid);
+
+                // Get process name from PID
+                std::wstring procName = GetProcessNameByPid(sessionPid);
+
+                // Get peak level
+                float peakLevel = 0.0f;
+                ComPtr<IAudioMeterInformation> meter;
+                if (SUCCEEDED(sessionControl.As(&meter))) {
+                    meter->GetPeakValue(&peakLevel);
+                }
+
+                // Get parent PID
+                DWORD parentPid = GetParentProcessId(sessionPid);
+                std::wstring parentName = (parentPid != 0) ? GetProcessNameByPid(parentPid) : L"(none)";
+
+                Log(L"[DIAG] Session " + std::to_wstring(i) +
+                    L": PID=" + std::to_wstring(sessionPid) +
+                    L" Name=" + procName +
+                    L" ParentPID=" + std::to_wstring(parentPid) +
+                    L" ParentName=" + parentName +
+                    L" Peak=" + std::to_wstring(peakLevel), LogLevel::LOG_DEBUG);
+            }
+        }
     }
 
     void Reset() {
@@ -1208,6 +1323,15 @@ void MonitorThread() {
 
             std::vector<FoundProcess> targetProcs = FindTargetProcesses(config);
             std::set<DWORD> currentPids;
+
+            // Log found target processes
+            for (size_t j = 0; j < targetProcs.size(); j++) {
+                Log(L"[DIAG] Found target: " + targetProcs[j].name +
+                    L" PID=" + std::to_wstring(targetProcs[j].pid), LogLevel::LOG_DEBUG);
+            }
+
+            // Dump all audio sessions periodically (every poll) for diagnostics
+            audioMonitor.DumpAudioSessions();
 
             for (size_t i = 0; i < targetProcs.size(); i++) {
                 DWORD pid = targetProcs[i].pid;
