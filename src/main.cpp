@@ -715,66 +715,52 @@ public:
     ~AudioSessionMonitor() = default;
 
     // Check if a process (or any of its child processes) has real audio on ANY device
+    // Uses cached default device for speed, falls back to full enumeration if needed
     bool CheckProcessRealAudio(DWORD processId, float threshold = AUDIO_PEAK_THRESHOLD) {
-        if (!EnsureEnumeratorInitialized()) return false;
+        if (!EnsureDefaultDeviceCached()) return false;
 
-        // Check across ALL active render devices
-        ComPtr<IMMDeviceCollection> deviceCollection;
-        HRESULT hr = m_deviceEnumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &deviceCollection);
-        if (FAILED(hr) || !deviceCollection) return false;
+        // Fast path: check cached default render device first
+        if (CheckSessionsOnDevice(m_cachedSessionManager, processId, threshold)) {
+            return true;
+        }
+        return false;
+    }
 
-        UINT deviceCount = 0;
-        deviceCollection->GetCount(&deviceCount);
+private:
+    // Check audio sessions on a specific device's session manager
+    bool CheckSessionsOnDevice(ComPtr<IAudioSessionManager2>& sessionManager, DWORD processId, float threshold) {
+        if (!sessionManager) return false;
 
-        for (UINT d = 0; d < deviceCount; d++) {
-            ComPtr<IMMDevice> device;
-            if (FAILED(deviceCollection->Item(d, &device)) || !device) continue;
+        ComPtr<IAudioSessionEnumerator> sessionEnumerator;
+        HRESULT hr = sessionManager->GetSessionEnumerator(&sessionEnumerator);
+        if (FAILED(hr) || !sessionEnumerator) return false;
 
-            ComPtr<IAudioSessionManager2> sessionManager;
-            hr = device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL,
-                nullptr, reinterpret_cast<void**>(sessionManager.GetAddressOf()));
-            if (FAILED(hr) || !sessionManager) continue;
+        int sessionCount = 0;
+        sessionEnumerator->GetCount(&sessionCount);
 
-            ComPtr<IAudioSessionEnumerator> sessionEnumerator;
-            hr = sessionManager->GetSessionEnumerator(&sessionEnumerator);
-            if (FAILED(hr) || !sessionEnumerator) continue;
+        for (int i = 0; i < sessionCount; i++) {
+            ComPtr<IAudioSessionControl> sessionControl;
+            if (FAILED(sessionEnumerator->GetSession(i, &sessionControl)) || !sessionControl)
+                continue;
 
-            int sessionCount = 0;
-            sessionEnumerator->GetCount(&sessionCount);
+            ComPtr<IAudioSessionControl2> sessionControl2;
+            if (SUCCEEDED(sessionControl.As(&sessionControl2))) {
+                DWORD sessionProcessId = 0;
+                if (SUCCEEDED(sessionControl2->GetProcessId(&sessionProcessId))) {
+                    // Fast path: direct PID match
+                    bool isMatch = (sessionProcessId == processId);
+                    // Slow path: check if session belongs to a child of target process
+                    if (!isMatch && sessionProcessId != 0) {
+                        isMatch = IsChildOfProcess(sessionProcessId, processId);
+                    }
 
-            for (int i = 0; i < sessionCount; i++) {
-                ComPtr<IAudioSessionControl> sessionControl;
-                if (FAILED(sessionEnumerator->GetSession(i, &sessionControl)) || !sessionControl)
-                    continue;
-
-                ComPtr<IAudioSessionControl2> sessionControl2;
-                if (SUCCEEDED(sessionControl.As(&sessionControl2))) {
-                    DWORD sessionProcessId = 0;
-                    if (SUCCEEDED(sessionControl2->GetProcessId(&sessionProcessId))) {
-                        bool isMatch = (sessionProcessId == processId);
-                        if (!isMatch && sessionProcessId != 0) {
-                            isMatch = IsChildOfProcess(sessionProcessId, processId);
-                        }
-                        // Also check reverse: is the target process a child of the session process?
-                        if (!isMatch && sessionProcessId != 0) {
-                            std::wstring sessionProcName = GetProcessNameByPid(sessionProcessId);
-                            // Check if session process name matches any target
-                            for (const auto& target : GetConfigSnapshot().targetProcesses) {
-                                if (_wcsicmp(sessionProcName.c_str(), target.c_str()) == 0) {
-                                    isMatch = true;
-                                    break;
-                                }
-                            }
-                        }
-
-                        if (isMatch) {
-                            ComPtr<IAudioMeterInformation> meter;
-                            if (SUCCEEDED(sessionControl.As(&meter))) {
-                                float peakLevel = 0.0f;
-                                if (SUCCEEDED(meter->GetPeakValue(&peakLevel))) {
-                                    if (peakLevel > threshold) {
-                                        return true;
-                                    }
+                    if (isMatch) {
+                        ComPtr<IAudioMeterInformation> meter;
+                        if (SUCCEEDED(sessionControl.As(&meter))) {
+                            float peakLevel = 0.0f;
+                            if (SUCCEEDED(meter->GetPeakValue(&peakLevel))) {
+                                if (peakLevel > threshold) {
+                                    return true;
                                 }
                             }
                         }
@@ -784,6 +770,8 @@ public:
         }
         return false;
     }
+
+public:
 
     // Also check ALL audio sessions and return matching target process info
     // This is the "reverse" approach: enumerate sessions first, then match to targets
@@ -958,6 +946,8 @@ public:
     }
 
     void Reset() {
+        m_cachedSessionManager.Reset();
+        m_cachedDevice.Reset();
         m_deviceEnumerator.Reset();
         m_initialized = false;
     }
@@ -966,7 +956,7 @@ private:
     bool EnsureEnumeratorInitialized() {
         if (m_initialized && m_deviceEnumerator) return true;
 
-        Reset();
+        m_deviceEnumerator.Reset();
 
         HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
             CLSCTX_ALL, IID_PPV_ARGS(&m_deviceEnumerator));
@@ -976,7 +966,31 @@ private:
         return true;
     }
 
+    bool EnsureDefaultDeviceCached() {
+        if (m_cachedSessionManager) return true;
+
+        if (!EnsureEnumeratorInitialized()) return false;
+
+        HRESULT hr = m_deviceEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &m_cachedDevice);
+        if (FAILED(hr) || !m_cachedDevice) {
+            // Fallback: reset and retry next poll
+            Reset();
+            return false;
+        }
+
+        hr = m_cachedDevice->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL,
+            nullptr, reinterpret_cast<void**>(m_cachedSessionManager.GetAddressOf()));
+        if (FAILED(hr) || !m_cachedSessionManager) {
+            Reset();
+            return false;
+        }
+
+        return true;
+    }
+
     ComPtr<IMMDeviceEnumerator> m_deviceEnumerator;
+    ComPtr<IMMDevice> m_cachedDevice;
+    ComPtr<IAudioSessionManager2> m_cachedSessionManager;
     bool m_initialized = false;
 };
 
@@ -1466,8 +1480,12 @@ void MonitorThread() {
                     L" PID=" + std::to_wstring(targetProcs[j].pid), LogLevel::LOG_DEBUG);
             }
 
-            // Dump all audio sessions periodically (every poll) for diagnostics
-            audioMonitor.DumpAudioSessions();
+            // Dump all audio sessions periodically for diagnostics (every 15 cycles ~30s, not every poll!)
+            static int diagCounter = 0;
+            if (++diagCounter >= 15) {
+                diagCounter = 0;
+                audioMonitor.DumpAudioSessions();
+            }
 
             for (size_t i = 0; i < targetProcs.size(); i++) {
                 DWORD pid = targetProcs[i].pid;
