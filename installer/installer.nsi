@@ -1,6 +1,6 @@
 ; ============================================================
 ; RDP Call Recorder - NSIS Installer Script
-; Version: 2.5
+; Version: 2.6
 ; User-level installation (no admin rights required)
 ; ============================================================
 ; Build instructions:
@@ -21,11 +21,11 @@ RequestExecutionLevel user
 Unicode true
 
 ; --- Metadata ---
-VIProductVersion "2.5.0.0"
+VIProductVersion "2.6.0.0"
 VIAddVersionKey "ProductName" "RDP Call Recorder"
 VIAddVersionKey "CompanyName" "QC Department"
 VIAddVersionKey "FileDescription" "Call Recording Agent for RDP Sessions"
-VIAddVersionKey "FileVersion" "2.5.0"
+VIAddVersionKey "FileVersion" "2.6.0"
 VIAddVersionKey "LegalCopyright" "Internal Use Only"
 
 ; --- Interface ---
@@ -96,7 +96,7 @@ Section "Install"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
         "InstallLocation" "$INSTDIR"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
-        "DisplayVersion" "2.5.0"
+        "DisplayVersion" "2.6.0"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
         "Publisher" "QC Department"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \

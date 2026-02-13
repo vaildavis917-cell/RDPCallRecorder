@@ -1,4 +1,4 @@
-// main.cpp - RDP Call Recorder Agent v2.5
+// main.cpp - RDP Call Recorder Agent v2.6
 // Records WhatsApp/Telegram/Viber calls automatically in RDP sessions.
 // Uses AudioCapture library (https://github.com/masonasons/AudioCapture)
 //
@@ -55,8 +55,11 @@
 #include <audiopolicy.h>
 #include <endpointvolume.h>
 #include <wrl/client.h>  // [L3] ComPtr for RAII COM management
+#include <winhttp.h>     // Auto-update: HTTP requests to GitHub API
 #define SECURITY_WIN32
 #include <security.h>  // for GetUserNameExW (NameDisplay = Full Name)
+
+#pragma comment(lib, "winhttp.lib")
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
@@ -75,9 +78,14 @@ using Microsoft::WRL::ComPtr;  // [L3] RAII COM pointers
 #define IDM_OPEN_FOLDER    1002
 #define IDM_STATUS         1003
 #define IDM_EXIT           1004
+#define IDM_CHECK_UPDATE   1005
 
 static const wchar_t* WINDOW_CLASS_NAME = L"RDPCallRecorderWndClass";
 static const wchar_t* APP_TITLE = L"RDP Call Recorder";
+static const wchar_t* APP_VERSION = L"2.6.0";
+static const wchar_t* GITHUB_REPO_OWNER = L"vaildavis917-cell";
+static const wchar_t* GITHUB_REPO_NAME = L"RDPCallRecorder";
+static const int UPDATE_CHECK_INTERVAL_HOURS = 6;  // Check for updates every N hours
 
 // [C5] FIX: Changed from Global to Local — per RDP session, not per server
 static const wchar_t* MUTEX_SINGLE_INSTANCE = L"Local\\RDPCallRecorder_SingleInstance";
@@ -118,6 +126,8 @@ struct AgentConfig {
     std::wstring mutexName = L"Local\\RDPCallRecorderAgentMutex";  // [C5] Local, not Global
     std::wstring processPriority = L"BelowNormal";
     bool autoRegisterStartup = true;
+    bool autoUpdate = true;           // Check for updates automatically
+    int updateCheckIntervalHours = 6; // Hours between update checks
 };
 
 AgentConfig g_config;
@@ -138,6 +148,7 @@ HANDLE g_hMutex = nullptr;
 std::atomic<bool> g_running(true);
 std::atomic<int> g_activeRecordings(0);
 std::thread g_monitorThread;
+std::thread g_updateThread;
 
 // ============================================================
 // Log levels
@@ -172,6 +183,8 @@ void CreateTrayIcon(HWND hWnd);
 void RemoveTrayIcon();
 void UpdateTrayTooltip();
 void ShowTrayMenu(HWND hWnd);
+void CheckForUpdates(bool showNoUpdateMsg = false);
+void AutoUpdateThread();
 LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -395,6 +408,10 @@ bool LoadConfig(AgentConfig& config) {
     config.mutexName           = GetIniString(L"Advanced", L"MutexName", config.mutexName, iniPath);
     config.processPriority     = GetIniString(L"Advanced", L"ProcessPriority", config.processPriority, iniPath);
     config.autoRegisterStartup = GetIniBool(L"Advanced", L"AutoRegisterStartup", config.autoRegisterStartup, iniPath);
+    config.autoUpdate            = GetIniBool(L"Advanced", L"AutoUpdate", config.autoUpdate, iniPath);
+    config.updateCheckIntervalHours = GetIniInt(L"Advanced", L"UpdateCheckIntervalHours", config.updateCheckIntervalHours, iniPath);
+    if (config.updateCheckIntervalHours < 1) config.updateCheckIntervalHours = 1;
+    if (config.updateCheckIntervalHours > 168) config.updateCheckIntervalHours = 168; // max 1 week
 
     return true;
 }
@@ -426,6 +443,8 @@ void SaveConfig() {
     WritePrivateProfileStringW(L"Advanced", L"HideConsole", g_config.hideConsole ? L"true" : L"false", iniPath.c_str());
     WritePrivateProfileStringW(L"Advanced", L"AutoRegisterStartup", g_config.autoRegisterStartup ? L"true" : L"false", iniPath.c_str());
     WritePrivateProfileStringW(L"Advanced", L"ProcessPriority", g_config.processPriority.c_str(), iniPath.c_str());
+    WritePrivateProfileStringW(L"Advanced", L"AutoUpdate", g_config.autoUpdate ? L"true" : L"false", iniPath.c_str());
+    WritePrivateProfileStringW(L"Advanced", L"UpdateCheckIntervalHours", std::to_wstring(g_config.updateCheckIntervalHours).c_str(), iniPath.c_str());
     WritePrivateProfileStringW(L"Advanced", L"Configured", L"true", iniPath.c_str());
 }
 
@@ -700,6 +719,268 @@ bool IsChildOfProcess(DWORD childPid, DWORD parentPid) {
         current = parent;
     }
     return false;
+}
+
+// ============================================================
+// AUTO-UPDATE: GitHub Releases API
+// Checks latest release tag, compares with APP_VERSION,
+// downloads installer and runs silent update.
+// ============================================================
+
+// Compare version strings like "2.6.0" > "2.5.1"
+static bool IsNewerVersion(const std::wstring& remote, const std::wstring& local) {
+    auto parseVer = [](const std::wstring& v) -> std::tuple<int,int,int> {
+        int major = 0, minor = 0, patch = 0;
+        swscanf_s(v.c_str(), L"%d.%d.%d", &major, &minor, &patch);
+        return {major, minor, patch};
+    };
+    return parseVer(remote) > parseVer(local);
+}
+
+// Strip leading 'v' from tag like "v2.6.0" -> "2.6.0"
+static std::wstring StripVersionPrefix(const std::wstring& tag) {
+    if (!tag.empty() && (tag[0] == L'v' || tag[0] == L'V')) return tag.substr(1);
+    return tag;
+}
+
+// Simple JSON string value extractor (no full parser needed)
+static std::wstring ExtractJsonString(const std::wstring& json, const std::wstring& key) {
+    std::wstring search = L"\"" + key + L"\"";
+    size_t pos = json.find(search);
+    if (pos == std::wstring::npos) return L"";
+    pos = json.find(L':', pos + search.length());
+    if (pos == std::wstring::npos) return L"";
+    pos = json.find(L'"', pos + 1);
+    if (pos == std::wstring::npos) return L"";
+    size_t end = json.find(L'"', pos + 1);
+    if (end == std::wstring::npos) return L"";
+    return json.substr(pos + 1, end - pos - 1);
+}
+
+// HTTP GET via WinHTTP — returns response body as wstring
+static std::wstring WinHttpGet(const std::wstring& host, const std::wstring& path) {
+    std::wstring result;
+    HINTERNET hSession = WinHttpOpen(L"RDPCallRecorder-AutoUpdate/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return result;
+
+    HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return result; }
+
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path.c_str(),
+        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return result; }
+
+    if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(hRequest, nullptr)) {
+        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+        return result;
+    }
+
+    std::string body;
+    DWORD bytesRead = 0;
+    char buffer[4096];
+    while (WinHttpReadData(hRequest, buffer, sizeof(buffer), &bytesRead) && bytesRead > 0) {
+        body.append(buffer, bytesRead);
+    }
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+
+    // Convert UTF-8 body to wstring
+    if (!body.empty()) {
+        int needed = MultiByteToWideChar(CP_UTF8, 0, body.c_str(), (int)body.size(), nullptr, 0);
+        if (needed > 0) {
+            result.resize(needed);
+            MultiByteToWideChar(CP_UTF8, 0, body.c_str(), (int)body.size(), &result[0], needed);
+        }
+    }
+    return result;
+}
+
+// Download file via WinHTTP to local path
+static bool WinHttpDownloadFile(const std::wstring& url, const std::wstring& localPath) {
+    // Parse URL: expect https://github.com/...
+    URL_COMPONENTS urlComp = {};
+    urlComp.dwStructSize = sizeof(urlComp);
+    wchar_t hostBuf[256] = {}, pathBuf[2048] = {};
+    urlComp.lpszHostName = hostBuf;
+    urlComp.dwHostNameLength = 256;
+    urlComp.lpszUrlPath = pathBuf;
+    urlComp.dwUrlPathLength = 2048;
+
+    if (!WinHttpCrackUrl(url.c_str(), (DWORD)url.length(), 0, &urlComp)) return false;
+
+    HINTERNET hSession = WinHttpOpen(L"RDPCallRecorder-AutoUpdate/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return false;
+
+    HINTERNET hConnect = WinHttpConnect(hSession, urlComp.lpszHostName, urlComp.nPort, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
+
+    DWORD flags = (urlComp.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", urlComp.lpszUrlPath,
+        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
+
+    // Follow redirects (GitHub uses them for release downloads)
+    DWORD optionValue = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &optionValue, sizeof(optionValue));
+
+    if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(hRequest, nullptr)) {
+        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    // Check HTTP status
+    DWORD statusCode = 0, statusSize = sizeof(statusCode);
+    WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+    if (statusCode != 200) {
+        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    HANDLE hFile = CreateFileW(localPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    char buffer[8192];
+    DWORD bytesRead = 0, bytesWritten = 0;
+    bool ok = true;
+    while (WinHttpReadData(hRequest, buffer, sizeof(buffer), &bytesRead) && bytesRead > 0) {
+        if (!WriteFile(hFile, buffer, bytesRead, &bytesWritten, nullptr)) { ok = false; break; }
+    }
+
+    CloseHandle(hFile);
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return ok;
+}
+
+void CheckForUpdates(bool showNoUpdateMsg) {
+    Log(L"[UPDATE] Checking for updates...");
+
+    // GET /repos/{owner}/{repo}/releases/latest
+    std::wstring apiPath = std::wstring(L"/repos/") + GITHUB_REPO_OWNER + L"/" + GITHUB_REPO_NAME + L"/releases/latest";
+    std::wstring response = WinHttpGet(L"api.github.com", apiPath);
+
+    if (response.empty()) {
+        Log(L"[UPDATE] Failed to fetch release info from GitHub", LogLevel::LOG_ERROR);
+        if (showNoUpdateMsg) {
+            MessageBoxW(nullptr, L"Failed to connect to GitHub. Check internet connection.",
+                APP_TITLE, MB_OK | MB_ICONWARNING);
+        }
+        return;
+    }
+
+    std::wstring tagName = StripVersionPrefix(ExtractJsonString(response, L"tag_name"));
+    if (tagName.empty()) {
+        Log(L"[UPDATE] Could not parse tag_name from GitHub response", LogLevel::LOG_ERROR);
+        return;
+    }
+
+    Log(L"[UPDATE] Latest release: " + tagName + L", current: " + APP_VERSION);
+
+    if (!IsNewerVersion(tagName, APP_VERSION)) {
+        Log(L"[UPDATE] Already up to date");
+        if (showNoUpdateMsg) {
+            MessageBoxW(nullptr, (std::wstring(L"You are running the latest version (") + APP_VERSION + L").").c_str(),
+                APP_TITLE, MB_OK | MB_ICONINFORMATION);
+        }
+        return;
+    }
+
+    // Found newer version — ask user
+    std::wstring msg = L"New version " + tagName + L" available (current: " + APP_VERSION + L").\n\nDownload and install update?";
+    int choice = MessageBoxW(nullptr, msg.c_str(), APP_TITLE, MB_YESNO | MB_ICONQUESTION);
+    if (choice != IDYES) {
+        Log(L"[UPDATE] User declined update");
+        return;
+    }
+
+    // Find download URL for RDPCallRecorder_Setup.exe
+    // Look for "browser_download_url" containing "Setup.exe"
+    std::wstring downloadUrl;
+    size_t pos = 0;
+    while ((pos = response.find(L"browser_download_url", pos)) != std::wstring::npos) {
+        size_t urlStart = response.find(L"https://", pos);
+        if (urlStart == std::wstring::npos) break;
+        size_t urlEnd = response.find(L'"', urlStart);
+        if (urlEnd == std::wstring::npos) break;
+        std::wstring candidateUrl = response.substr(urlStart, urlEnd - urlStart);
+        if (candidateUrl.find(L"Setup.exe") != std::wstring::npos ||
+            candidateUrl.find(L"setup.exe") != std::wstring::npos ||
+            candidateUrl.find(L".exe") != std::wstring::npos) {
+            downloadUrl = candidateUrl;
+            break;
+        }
+        pos = urlEnd;
+    }
+
+    if (downloadUrl.empty()) {
+        Log(L"[UPDATE] No installer found in release assets", LogLevel::LOG_ERROR);
+        MessageBoxW(nullptr, L"Update found but no installer in release. Please update manually.",
+            APP_TITLE, MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    Log(L"[UPDATE] Downloading: " + downloadUrl);
+
+    // Download to temp folder
+    wchar_t tempPath[MAX_PATH];
+    GetTempPathW(MAX_PATH, tempPath);
+    std::wstring installerPath = std::wstring(tempPath) + L"RDPCallRecorder_Setup_update.exe";
+
+    if (!WinHttpDownloadFile(downloadUrl, installerPath)) {
+        Log(L"[UPDATE] Download failed", LogLevel::LOG_ERROR);
+        MessageBoxW(nullptr, L"Failed to download update. Please try again later.",
+            APP_TITLE, MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    Log(L"[UPDATE] Downloaded to: " + installerPath);
+    Log(L"[UPDATE] Launching installer and exiting...");
+
+    // Launch installer with /S for silent NSIS install
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {};
+    std::wstring cmdLine = L"\"" + installerPath + L"\" /S";
+    if (CreateProcessW(nullptr, &cmdLine[0], nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        // Exit current instance so installer can replace the exe
+        g_running = false;
+        RemoveTrayIcon();
+        PostQuitMessage(0);
+    } else {
+        Log(L"[UPDATE] Failed to launch installer", LogLevel::LOG_ERROR);
+        MessageBoxW(nullptr, L"Failed to launch installer. Please install manually.",
+            APP_TITLE, MB_OK | MB_ICONERROR);
+    }
+}
+
+void AutoUpdateThread() {
+    // Wait a bit after startup before first check
+    std::this_thread::sleep_for(std::chrono::minutes(2));
+
+    while (g_running) {
+        auto config = GetConfigSnapshot();
+        if (config.autoUpdate) {
+            CheckForUpdates(false);
+        }
+        // Sleep for configured interval
+        int hours = config.updateCheckIntervalHours;
+        for (int i = 0; i < hours * 60 && g_running; i++) {
+            std::this_thread::sleep_for(std::chrono::minutes(1));
+        }
+    }
 }
 
 // ============================================================
@@ -1372,6 +1653,7 @@ void ShowTrayMenu(HWND hWnd) {
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, IDM_SETTINGS, L"Settings...");
     AppendMenuW(hMenu, MF_STRING, IDM_OPEN_FOLDER, L"Open recordings folder");
+    AppendMenuW(hMenu, MF_STRING, IDM_CHECK_UPDATE, L"Check for updates...");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, IDM_EXIT, L"Exit");
 
@@ -1413,6 +1695,9 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             ShellExecuteW(nullptr, L"open", config.recordingPath.c_str(), nullptr, nullptr, SW_SHOW);
             break;
         }
+        case IDM_CHECK_UPDATE:
+            CheckForUpdates(true);
+            break;
         case IDM_EXIT:
             g_running = false;
             RemoveTrayIcon();
@@ -1744,7 +2029,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     CreateTrayIcon(g_hWndMain);
 
     // Log startup
-    Log(L"=== RDP Call Recorder Agent v2.5 started ===");
+    Log(L"=== RDP Call Recorder Agent v" + std::wstring(APP_VERSION) + L" started ===");
     Log(L"User: " + GetCurrentFullName() + L" (login: " + GetCurrentLoginName() + L")");
     Log(L"Recording path: " + GetConfigSnapshot().recordingPath);
     Log(L"Mode: Mixed recording (both voices)");
@@ -1756,6 +2041,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Start monitor thread
     g_monitorThread = std::thread(MonitorThread);
+
+    // Start auto-update thread
+    if (g_config.autoUpdate) {
+        g_updateThread = std::thread(AutoUpdateThread);
+    }
 
     // Message loop
     MSG msg;
@@ -1771,6 +2061,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     g_running = false;
     if (g_monitorThread.joinable()) {
         g_monitorThread.join();
+    }
+    if (g_updateThread.joinable()) {
+        g_updateThread.join();
     }
     RemoveTrayIcon();
     CloseLogFile();  // [H3] Close buffered log file
