@@ -1,0 +1,150 @@
+#include "MonitorThread.h"
+#include "Config.h"
+#include "Logger.h"
+#include "Utils.h"
+#include "Globals.h"
+#include "ProcessUtils.h"
+#include "AudioMonitor.h"
+#include "TrayIcon.h"
+#include "CaptureManager.h"
+#include "ProcessEnumerator.h"
+#include <roapi.h>
+#include <map>
+#include <set>
+#include <thread>
+#include <chrono>
+
+void MonitorThread() {
+    HRESULT hr = RoInitialize(RO_INIT_MULTITHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE && hr != S_FALSE)
+        hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+    CaptureManager captureManager;
+    ProcessEnumerator processEnum;
+    AudioFormat audioFormat = GetAudioFormatFromConfig();
+    AudioSessionMonitor audioMonitor;
+
+    std::map<DWORD, CallRecordingState> callState;
+    std::map<DWORD, int> silenceCounter;
+    std::map<DWORD, int> startCounter;
+    DWORD nextMicSessionId = MIC_SESSION_ID_BASE;
+    int activeMixedCount = 0;
+
+    while (g_running) {
+        try {
+            audioFormat = GetAudioFormatFromConfig();
+            AgentConfig config = GetConfigSnapshot();
+            std::vector<FoundProcess> targetProcs = FindTargetProcesses(config);
+            std::set<DWORD> currentPids;
+
+            for (auto& tp : targetProcs)
+                Log(L"[DIAG] Found target: " + tp.name + L" PID=" + std::to_wstring(tp.pid), LogLevel::LOG_DEBUG);
+
+            static int diagCounter = 0;
+            if (++diagCounter >= 15) { diagCounter = 0; audioMonitor.DumpAudioSessions(); }
+
+            for (auto& tp : targetProcs) {
+                DWORD pid = tp.pid;
+                std::wstring name = tp.name;
+                currentPids.insert(pid);
+                bool hasRealAudio = audioMonitor.CheckProcessRealAudio(pid);
+
+                if (hasRealAudio && !callState[pid].isRecording) {
+                    startCounter[pid]++;
+                    Log(L"Audio detected: " + name + L" PID=" + std::to_wstring(pid) +
+                        L" count=" + std::to_wstring(startCounter[pid]) + L"/" + std::to_wstring(config.startThreshold), LogLevel::LOG_DEBUG);
+
+                    if (startCounter[pid] < config.startThreshold) continue;
+
+                    startCounter[pid] = 0;
+                    silenceCounter[pid] = 0;
+                    std::wstring outputPath = BuildOutputPath(name, audioFormat);
+                    DWORD micSessId = nextMicSessionId++;
+                    if (nextMicSessionId >= 0xFFFFFFFF) nextMicSessionId = MIC_SESSION_ID_BASE;
+
+                    bool procStarted = captureManager.StartCapture(pid, name, outputPath, audioFormat, config.mp3Bitrate, false, L"", true);
+                    if (!procStarted) { Log(L"REC FAIL (process): " + name, LogLevel::LOG_ERROR); continue; }
+
+                    bool micStarted = false;
+                    MicInfo mic = GetDefaultMicrophone();
+                    if (mic.found) {
+                        micStarted = captureManager.StartCaptureFromDevice(micSessId, mic.friendlyName, mic.deviceId, true,
+                            outputPath, audioFormat, config.mp3Bitrate, false, true);
+                        if (!micStarted) Log(L"Mic capture failed: " + mic.friendlyName, LogLevel::LOG_WARN);
+                    }
+
+                    bool mixedOk = captureManager.EnableMixedRecording(outputPath, audioFormat, config.mp3Bitrate);
+                    if (!mixedOk) {
+                        Log(L"Mixed recording failed, falling back to process-only", LogLevel::LOG_WARN);
+                        captureManager.StopCapture(pid);
+                        if (micStarted) captureManager.StopCapture(micSessId);
+                        bool directStarted = captureManager.StartCapture(pid, name, outputPath, audioFormat, config.mp3Bitrate, false, L"", false);
+                        if (!directStarted) { Log(L"REC FAIL (fallback): " + name, LogLevel::LOG_ERROR); continue; }
+                        micSessId = 0;
+                    }
+
+                    callState[pid] = { true, outputPath, name, pid, micStarted ? micSessId : (DWORD)0, mixedOk };
+                    g_activeRecordings++;
+                    if (mixedOk) activeMixedCount++;
+                    Log(L"REC START: " + name + L" PID=" + std::to_wstring(pid) + L" -> " + outputPath);
+                    UpdateTrayTooltip();
+
+                } else if (!hasRealAudio && !callState[pid].isRecording) {
+                    startCounter[pid] = 0;
+
+                } else if (!hasRealAudio && callState[pid].isRecording) {
+                    silenceCounter[pid]++;
+                    if (silenceCounter[pid] >= config.silenceThreshold) {
+                        auto& cs = callState[pid];
+                        if (cs.mixedEnabled) {
+                            activeMixedCount--;
+                            if (activeMixedCount <= 0) { captureManager.DisableMixedRecording(); activeMixedCount = 0; }
+                        }
+                        if (cs.micSessionId != 0) captureManager.StopCapture(cs.micSessionId);
+                        captureManager.StopCapture(pid);
+                        Log(L"REC STOP: " + cs.processName + L" PID=" + std::to_wstring(pid) + L" -> " + cs.outputPath);
+                        cs = {};
+                        silenceCounter[pid] = 0;
+                        g_activeRecordings--;
+                        UpdateTrayTooltip();
+                    }
+                } else if (hasRealAudio && callState[pid].isRecording) {
+                    silenceCounter[pid] = 0;
+                }
+            }
+
+            std::vector<DWORD> toRemove;
+            for (auto& [pid, cs] : callState) {
+                if (currentPids.find(pid) == currentPids.end()) {
+                    if (cs.isRecording) {
+                        if (cs.mixedEnabled) {
+                            activeMixedCount--;
+                            if (activeMixedCount <= 0) { captureManager.DisableMixedRecording(); activeMixedCount = 0; }
+                        }
+                        if (cs.micSessionId != 0) captureManager.StopCapture(cs.micSessionId);
+                        captureManager.StopCapture(pid);
+                        Log(L"REC STOP (exited): " + cs.processName + L" PID=" + std::to_wstring(pid), LogLevel::LOG_WARN);
+                        cs.isRecording = false;
+                        g_activeRecordings--;
+                    }
+                    toRemove.push_back(pid);
+                }
+            }
+            for (DWORD p : toRemove) { callState.erase(p); silenceCounter.erase(p); startCounter.erase(p); }
+            UpdateTrayTooltip();
+
+        } catch (const std::exception& e) {
+            Log(L"Exception: " + Utf8ToWide(e.what()), LogLevel::LOG_ERROR);
+        } catch (...) {
+            Log(L"Unknown exception", LogLevel::LOG_ERROR);
+        }
+
+        AgentConfig config = GetConfigSnapshot();
+        for (int i = 0; i < config.pollIntervalSeconds * 10 && g_running; i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    captureManager.DisableMixedRecording();
+    captureManager.StopAllCaptures();
+    RoUninitialize();
+}
