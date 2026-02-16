@@ -9,6 +9,7 @@
 #include "AutoUpdate.h"
 #include "resource.h"
 #include <windows.h>
+#include <objbase.h>
 #include <commctrl.h>
 
 #pragma comment(lib, "comctl32.lib")
