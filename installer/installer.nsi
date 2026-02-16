@@ -58,6 +58,10 @@ VIAddVersionKey "LegalCopyright" "Internal Use Only"
 Section "Install"
     SetOutPath "$INSTDIR"
 
+    ; Kill running instance before overwriting
+    nsExec::ExecToLog 'taskkill /F /IM RDPCallRecorder.exe'
+    Sleep 1500
+
     ; Copy files
     File "files\RDPCallRecorder.exe"
     File "files\config.ini"

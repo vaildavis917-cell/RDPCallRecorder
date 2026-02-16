@@ -159,6 +159,9 @@ static bool CreateUpdateBat(const std::wstring& batPath, const std::wstring& ins
     f << "    timeout /t 1 /nobreak >NUL\r\n";
     f << "    goto waitloop\r\n";
     f << ")\r\n";
+    // Force kill as safety net in case graceful shutdown didn't work
+    f << "taskkill /F /IM RDPCallRecorder.exe >NUL 2>&1\r\n";
+    f << "timeout /t 2 /nobreak >NUL\r\n";
     f << "echo Installing update...\r\n";
     f << "\"" << installerNarrow << "\" /S\r\n";
     // Wait for installer to finish
