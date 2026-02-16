@@ -2,12 +2,14 @@
 #include "Config.h"
 #include "Logger.h"
 #include "Globals.h"
+#include "TrayIcon.h"
 #include <windows.h>
 #include <winhttp.h>
 #include <string>
 #include <tuple>
 #include <thread>
 #include <chrono>
+#include <fstream>
 
 #pragma comment(lib, "winhttp.lib")
 
@@ -132,6 +134,44 @@ static bool WinHttpDownloadFile(const std::wstring& url, const std::wstring& loc
     return ok;
 }
 
+// Create a helper .bat script that:
+// 1. Waits for the current process to exit
+// 2. Runs the installer silently
+// 3. Restarts the app
+// 4. Cleans up after itself
+static bool CreateUpdateBat(const std::wstring& batPath, const std::wstring& installerPath,
+                            const std::wstring& exePath, DWORD currentPid) {
+    std::ofstream f(batPath, std::ios::trunc);
+    if (!f.is_open()) return false;
+
+    // Convert wide strings to narrow for the bat file
+    char installerNarrow[MAX_PATH] = {}, exeNarrow[MAX_PATH] = {}, batNarrow[MAX_PATH] = {};
+    WideCharToMultiByte(CP_ACP, 0, installerPath.c_str(), -1, installerNarrow, MAX_PATH, nullptr, nullptr);
+    WideCharToMultiByte(CP_ACP, 0, exePath.c_str(), -1, exeNarrow, MAX_PATH, nullptr, nullptr);
+    WideCharToMultiByte(CP_ACP, 0, batPath.c_str(), -1, batNarrow, MAX_PATH, nullptr, nullptr);
+
+    f << "@echo off\r\n";
+    f << "echo Waiting for RDP Call Recorder to close...\r\n";
+    // Wait for the current process to exit (poll every 1 second, max 30 seconds)
+    f << ":waitloop\r\n";
+    f << "tasklist /FI \"PID eq " << currentPid << "\" 2>NUL | find /I \"" << currentPid << "\" >NUL\r\n";
+    f << "if %ERRORLEVEL%==0 (\r\n";
+    f << "    timeout /t 1 /nobreak >NUL\r\n";
+    f << "    goto waitloop\r\n";
+    f << ")\r\n";
+    f << "echo Installing update...\r\n";
+    f << "\"" << installerNarrow << "\" /S\r\n";
+    // Wait for installer to finish
+    f << "echo Starting RDP Call Recorder...\r\n";
+    f << "timeout /t 2 /nobreak >NUL\r\n";
+    f << "start \"\" \"" << exeNarrow << "\"\r\n";
+    // Clean up
+    f << "del \"" << installerNarrow << "\" >NUL 2>&1\r\n";
+    f << "del \"%~f0\" >NUL 2>&1\r\n";
+    f.close();
+    return true;
+}
+
 void CheckForUpdates(bool showNoUpdateMsg) {
     Log(L"[UPDATE] Checking for updates...");
     std::wstring apiPath = std::wstring(L"/repos/") + GITHUB_REPO_OWNER + L"/" + GITHUB_REPO_NAME + L"/releases/latest";
@@ -180,9 +220,12 @@ void CheckForUpdates(bool showNoUpdateMsg) {
         return;
     }
 
+    Log(L"[UPDATE] Downloading: " + downloadUrl);
+
     wchar_t tempPath[MAX_PATH];
     GetTempPathW(MAX_PATH, tempPath);
     std::wstring installerPath = std::wstring(tempPath) + L"RDPCallRecorder_Setup_update.exe";
+    std::wstring batPath = std::wstring(tempPath) + L"RDPCallRecorder_update.bat";
 
     if (!WinHttpDownloadFile(downloadUrl, installerPath)) {
         Log(L"[UPDATE] Download failed", LogLevel::LOG_ERROR);
@@ -190,15 +233,41 @@ void CheckForUpdates(bool showNoUpdateMsg) {
         return;
     }
 
+    Log(L"[UPDATE] Download complete, preparing update...");
+
+    // Get current exe path for restart after update
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+
+    DWORD currentPid = GetCurrentProcessId();
+
+    if (!CreateUpdateBat(batPath, installerPath, exePath, currentPid)) {
+        Log(L"[UPDATE] Failed to create update script", LogLevel::LOG_ERROR);
+        MessageBoxW(nullptr, L"Failed to prepare update.", APP_TITLE, MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    // Launch the bat script hidden
     STARTUPINFOW si = {}; si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION pi = {};
-    std::wstring cmdLine = L"\"" + installerPath + L"\" /S";
-    if (CreateProcessW(nullptr, &cmdLine[0], nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
-        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    std::wstring cmdLine = L"cmd.exe /c \"" + batPath + L"\"";
+    if (CreateProcessW(nullptr, &cmdLine[0], nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        Log(L"[UPDATE] Update script launched, shutting down for update...");
+        // Clean shutdown — the bat script waits for us to exit
         g_running = false;
+        RemoveTrayIcon();
         PostQuitMessage(0);
     } else {
-        MessageBoxW(nullptr, L"Failed to launch installer.", APP_TITLE, MB_OK | MB_ICONERROR);
+        Log(L"[UPDATE] Failed to launch update script", LogLevel::LOG_ERROR);
+        MessageBoxW(nullptr, L"Failed to launch update.", APP_TITLE, MB_OK | MB_ICONERROR);
+        // Clean up
+        DeleteFileW(batPath.c_str());
+        DeleteFileW(installerPath.c_str());
     }
 }
 
