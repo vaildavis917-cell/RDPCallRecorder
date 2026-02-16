@@ -1,6 +1,7 @@
 #pragma once
 
 #include <windows.h>
+#include <shellapi.h>
 #include <atomic>
 #include <thread>
 #include <mutex>
