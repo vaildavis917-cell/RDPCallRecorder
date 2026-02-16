@@ -2,6 +2,7 @@
 #include "Config.h"
 #include "Utils.h"
 #include "Globals.h"
+#include "MainPanel.h"
 #include <fstream>
 #include <chrono>
 #include <mutex>
@@ -67,14 +68,19 @@ void Log(const std::wstring& message, LogLevel level) {
         tmNow.tm_year + 1900, tmNow.tm_mon + 1, tmNow.tm_mday,
         tmNow.tm_hour, tmNow.tm_min, tmNow.tm_sec);
 
-    std::wstring logLine = std::wstring(timeStr) + L" [" + levelStr + L"] " + message + L"\n";
+    std::wstring logLine = std::wstring(timeStr) + L" [" + levelStr + L"] " + message + L"\r\n";
+
+    // Push to UI ring buffer (thread-safe, no lock contention with file I/O)
+    g_statusData.PushLogLine(logLine);
 
     std::lock_guard<std::mutex> lock(g_logMutex);
     fs::path logDir = fs::path(config.recordingPath) / SanitizeForPath(GetCurrentFullName()) / L"logs";
     try {
         EnsureLogFileOpen(logDir);
         if (g_logFile.is_open()) {
-            g_logFile << logLine;
+            // Write \n to file (not \r\n — file uses Unix line endings)
+            std::wstring fileLine = std::wstring(timeStr) + L" [" + levelStr + L"] " + message + L"\n";
+            g_logFile << fileLine;
             if (level >= LogLevel::LOG_WARN) g_logFile.flush();
         }
     } catch (const std::exception&) {}

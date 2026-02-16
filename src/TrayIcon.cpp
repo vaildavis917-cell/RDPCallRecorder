@@ -38,7 +38,7 @@ void ShowTrayMenu(HWND hWnd) {
         ? L"Status: Recording (" + std::to_wstring(count) + L" active)"
         : L"Status: Monitoring";
 
-    AppendMenuW(hMenu, MF_STRING | MF_GRAYED, IDM_STATUS, statusText.c_str());
+    AppendMenuW(hMenu, MF_STRING, IDM_STATUS, statusText.c_str());
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, IDM_SETTINGS, L"Settings...");
     AppendMenuW(hMenu, MF_STRING, IDM_OPEN_FOLDER, L"Open recordings folder");

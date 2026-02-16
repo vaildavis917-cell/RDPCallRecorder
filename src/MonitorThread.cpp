@@ -6,6 +6,7 @@
 #include "ProcessUtils.h"
 #include "AudioMonitor.h"
 #include "TrayIcon.h"
+#include "MainPanel.h"
 #include "CaptureManager.h"
 #include "ProcessEnumerator.h"
 #include <roapi.h>
@@ -83,7 +84,8 @@ void MonitorThread() {
                         micSessId = 0;
                     }
 
-                    callState[pid] = { true, outputPath, name, pid, micStarted ? micSessId : (DWORD)0, mixedOk };
+                    callState[pid] = { true, outputPath, name, pid, micStarted ? micSessId : (DWORD)0, mixedOk,
+                                       std::chrono::steady_clock::now() };
                     g_activeRecordings++;
                     if (mixedOk) activeMixedCount++;
                     Log(L"REC START: " + name + L" PID=" + std::to_wstring(pid) + L" -> " + outputPath);
@@ -132,6 +134,23 @@ void MonitorThread() {
             }
             for (DWORD p : toRemove) { callState.erase(p); silenceCounter.erase(p); startCounter.erase(p); }
             UpdateTrayTooltip();
+
+            // Push active recordings to shared StatusData for UI
+            {
+                std::vector<ActiveRecordingInfo> activeRecs;
+                for (auto& [pid, cs] : callState) {
+                    if (cs.isRecording) {
+                        ActiveRecordingInfo info;
+                        info.pid = cs.processPid;
+                        info.processName = cs.processName;
+                        info.outputPath = cs.outputPath;
+                        info.startTime = cs.startTime;
+                        info.mixedEnabled = cs.mixedEnabled;
+                        activeRecs.push_back(info);
+                    }
+                }
+                g_statusData.SetRecordings(activeRecs);
+            }
 
         } catch (const std::exception& e) {
             Log(L"Exception: " + Utf8ToWide(e.what()), LogLevel::LOG_ERROR);

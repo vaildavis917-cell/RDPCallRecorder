@@ -4,6 +4,7 @@
 #include "Utils.h"
 #include "TrayIcon.h"
 #include "SettingsDialog.h"
+#include "MainPanel.h"
 #include "MonitorThread.h"
 #include "AutoUpdate.h"
 #include "resource.h"
@@ -25,14 +26,14 @@ UINT WM_OPEN_SETTINGS_MSG = 0;
 
 static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_OPEN_SETTINGS_MSG && WM_OPEN_SETTINGS_MSG != 0) {
-        ShowSettingsDialog(hWnd);
+        ShowMainPanel(hWnd);
         return 0;
     }
 
     switch (msg) {
     case WM_TRAYICON:
         if (lParam == WM_RBUTTONUP) ShowTrayMenu(hWnd);
-        else if (lParam == WM_LBUTTONDBLCLK) ShowSettingsDialog(hWnd);
+        else if (lParam == WM_LBUTTONDBLCLK) ShowMainPanel(hWnd);
         return 0;
     case WM_SHOW_SETTINGS:
         ShowSettingsDialog(hWnd);
@@ -40,6 +41,7 @@ static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case IDM_SETTINGS: ShowSettingsDialog(hWnd); break;
+        case IDM_STATUS: ShowMainPanelOnTab(0); break;
         case IDM_OPEN_FOLDER: ShellExecuteW(nullptr, L"open", GetConfigSnapshot().recordingPath.c_str(), nullptr, nullptr, SW_SHOW); break;
         case IDM_CHECK_UPDATE: CheckForUpdates(true); break;
         case IDM_EXIT: g_running = false; RemoveTrayIcon(); PostQuitMessage(0); break;
@@ -72,6 +74,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     if (g_config.autoRegisterStartup) RegisterAutoStart();
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    // Init common controls (needed for Tab Control and ListView)
+    INITCOMMONCONTROLSEX icex = {};
+    icex.dwSize = sizeof(icex);
+    icex.dwICC = ICC_TAB_CLASSES | ICC_LISTVIEW_CLASSES;
+    InitCommonControlsEx(&icex);
 
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(WNDCLASSEXW);
