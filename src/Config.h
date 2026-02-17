@@ -12,6 +12,9 @@ struct AgentConfig {
     int pollIntervalSeconds = 2;
     int silenceThreshold = 3;
     int startThreshold = 2;
+    float telegramSilencePeakThreshold = 0.03f;
+    int telegramPeakHistorySize = 5;
+    int telegramSilenceCycles = 5;
     std::vector<std::wstring> targetProcesses = { L"WhatsApp.exe", L"Telegram.exe", L"Viber.exe" };
     bool enableLogging = true;
     std::wstring logLevel = L"INFO";

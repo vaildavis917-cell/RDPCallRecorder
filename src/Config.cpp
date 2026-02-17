@@ -56,12 +56,24 @@ bool LoadConfig(AgentConfig& config) {
     config.silenceThreshold    = GetIniInt(L"Monitoring", L"SilenceThreshold", config.silenceThreshold, iniPath);
     config.startThreshold      = GetIniInt(L"Monitoring", L"StartThreshold", config.startThreshold, iniPath);
 
+    // Telegram-specific parameters
+    std::wstring tgPeakStr = GetIniString(L"Monitoring", L"TelegramSilencePeakThreshold", L"0.03", iniPath);
+    config.telegramSilencePeakThreshold = (float)_wtof(tgPeakStr.c_str());
+    config.telegramPeakHistorySize = GetIniInt(L"Monitoring", L"TelegramPeakHistorySize", config.telegramPeakHistorySize, iniPath);
+    config.telegramSilenceCycles   = GetIniInt(L"Monitoring", L"TelegramSilenceCycles", config.telegramSilenceCycles, iniPath);
+
     if (config.pollIntervalSeconds < 1) config.pollIntervalSeconds = 1;
     if (config.pollIntervalSeconds > 60) config.pollIntervalSeconds = 60;
     if (config.silenceThreshold < 1) config.silenceThreshold = 1;
     if (config.silenceThreshold > 100) config.silenceThreshold = 100;
     if (config.startThreshold < 1) config.startThreshold = 1;
     if (config.startThreshold > 100) config.startThreshold = 100;
+    if (config.telegramSilencePeakThreshold < 0.001f) config.telegramSilencePeakThreshold = 0.001f;
+    if (config.telegramSilencePeakThreshold > 1.0f) config.telegramSilencePeakThreshold = 1.0f;
+    if (config.telegramPeakHistorySize < 1) config.telegramPeakHistorySize = 1;
+    if (config.telegramPeakHistorySize > 50) config.telegramPeakHistorySize = 50;
+    if (config.telegramSilenceCycles < 1) config.telegramSilenceCycles = 1;
+    if (config.telegramSilenceCycles > 100) config.telegramSilenceCycles = 100;
 
     std::wstring processesStr = GetIniString(L"Processes", L"TargetProcesses", L"WhatsApp.exe,Telegram.exe,Viber.exe", iniPath);
     auto parsed = SplitString(processesStr, L',');
@@ -96,6 +108,13 @@ void SaveConfig() {
     WritePrivateProfileStringW(L"Monitoring", L"PollInterval", std::to_wstring(g_config.pollIntervalSeconds).c_str(), iniPath.c_str());
     WritePrivateProfileStringW(L"Monitoring", L"SilenceThreshold", std::to_wstring(g_config.silenceThreshold).c_str(), iniPath.c_str());
     WritePrivateProfileStringW(L"Monitoring", L"StartThreshold", std::to_wstring(g_config.startThreshold).c_str(), iniPath.c_str());
+
+    // Telegram-specific parameters
+    wchar_t tgPeakBuf[32];
+    swprintf_s(tgPeakBuf, 32, L"%.3f", g_config.telegramSilencePeakThreshold);
+    WritePrivateProfileStringW(L"Monitoring", L"TelegramSilencePeakThreshold", tgPeakBuf, iniPath.c_str());
+    WritePrivateProfileStringW(L"Monitoring", L"TelegramPeakHistorySize", std::to_wstring(g_config.telegramPeakHistorySize).c_str(), iniPath.c_str());
+    WritePrivateProfileStringW(L"Monitoring", L"TelegramSilenceCycles", std::to_wstring(g_config.telegramSilenceCycles).c_str(), iniPath.c_str());
 
     std::wstring procStr;
     for (size_t i = 0; i < g_config.targetProcesses.size(); i++) {

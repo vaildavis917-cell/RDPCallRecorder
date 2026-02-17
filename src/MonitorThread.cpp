@@ -18,10 +18,11 @@
 #include <algorithm>
 #include <numeric>
 
-// Telegram-specific silence detection constants
-static const float  TELEGRAM_SILENCE_PEAK_THRESHOLD = 0.03f;  // avg peak below this = silence
-static const int    TELEGRAM_PEAK_HISTORY_SIZE       = 5;      // rolling window size (cycles)
-static const int    TELEGRAM_SILENCE_CYCLES          = 5;      // cycles of low avg peak to stop (= 10s at 2s poll)
+// Telegram-specific silence detection:
+// Parameters are loaded from config.ini [Monitoring] section:
+//   TelegramSilencePeakThreshold (default 0.03)
+//   TelegramPeakHistorySize (default 5)
+//   TelegramSilenceCycles (default 5)
 
 static bool IsTelegramProcess(const std::wstring& name) {
     std::wstring lower = name;
@@ -71,7 +72,7 @@ void MonitorThread() {
                 // Maintain rolling peak history for all processes (used for Telegram)
                 auto& history = peakHistory[pid];
                 history.push_back(currentPeak);
-                if ((int)history.size() > TELEGRAM_PEAK_HISTORY_SIZE)
+                if ((int)history.size() > config.telegramPeakHistorySize)
                     history.pop_front();
 
                 if (hasRealAudio && !callState[pid].isRecording) {
@@ -134,21 +135,21 @@ void MonitorThread() {
                         if (!history.empty()) {
                             avgPeak = std::accumulate(history.begin(), history.end(), 0.0f) / (float)history.size();
                         }
-                        isSilent = (avgPeak < TELEGRAM_SILENCE_PEAK_THRESHOLD);
+                        isSilent = (avgPeak < config.telegramSilencePeakThreshold);
 
                         Log(L"[TG] PID=" + std::to_wstring(pid) +
                             L" peak=" + std::to_wstring(currentPeak) +
                             L" avgPeak=" + std::to_wstring(avgPeak) +
                             L" silent=" + (isSilent ? L"YES" : L"NO") +
                             L" counter=" + std::to_wstring(silenceCounter[pid]) +
-                            L"/" + std::to_wstring(TELEGRAM_SILENCE_CYCLES), LogLevel::LOG_DEBUG);
+                            L"/" + std::to_wstring(config.telegramSilenceCycles), LogLevel::LOG_DEBUG);
                     } else {
                         isSilent = !hasRealAudio;
                     }
 
                     if (isSilent) {
                         silenceCounter[pid]++;
-                        int threshold = isTelegram ? TELEGRAM_SILENCE_CYCLES : config.silenceThreshold;
+                        int threshold = isTelegram ? config.telegramSilenceCycles : config.silenceThreshold;
 
                         if (silenceCounter[pid] >= threshold) {
                             auto& cs = callState[pid];
