@@ -59,6 +59,7 @@ static const int TAB_SETTINGS = 1;
 #define IDC_LOG_EDIT        3004
 #define IDC_VERSION_LABEL   3005
 #define IDC_STOP_REC_BTN    3006
+#define IDC_START_REC_BTN   3007
 
 // Control IDs — Settings tab
 #define IDC_PATH_EDIT       4001
@@ -88,6 +89,7 @@ static HWND g_hRecordingsList = nullptr;
 static HWND g_hLogEdit = nullptr;
 static HWND g_hVersionLabel = nullptr;
 static HWND g_hStopRecBtn = nullptr;
+static HWND g_hStartRecBtn = nullptr;
 
 // Settings tab controls
 static HWND g_hPathEdit = nullptr;
@@ -195,10 +197,12 @@ static void SwitchTab(int tab) {
 static void RefreshStatusTab() {
     if (!g_hPanel || g_currentTab != TAB_STATUS) return;
 
-    // Update status label and Stop button state
+    // Update status label and button states
     int count = g_activeRecordings.load();
     if (g_hStopRecBtn)
         EnableWindow(g_hStopRecBtn, count > 0 ? TRUE : FALSE);
+    if (g_hStartRecBtn)
+        EnableWindow(g_hStartRecBtn, count == 0 ? TRUE : FALSE);
     std::wstring statusText;
     if (count > 0)
         statusText = L"  Status: Recording (" + std::to_wstring(count) + L" active)";
@@ -385,8 +389,10 @@ static void CreateStatusTabControls(HWND hWnd) {
     SendMessageW(g_hLogEdit, WM_SETFONT, (WPARAM)g_hPanelFont, TRUE);
     g_statusControls.push_back(g_hLogEdit);
 
-    // Stop Recording button
-    g_hStopRecBtn = MakeButton(hWnd, L"Stop Recording", x, PANEL_HEIGHT - 55, 130, 28, IDC_STOP_REC_BTN);
+    // Start / Stop Recording buttons
+    g_hStartRecBtn = MakeButton(hWnd, L"Start Recording", x, PANEL_HEIGHT - 55, 130, 28, IDC_START_REC_BTN);
+    g_statusControls.push_back(g_hStartRecBtn);
+    g_hStopRecBtn = MakeButton(hWnd, L"Stop Recording", x + 140, PANEL_HEIGHT - 55, 130, 28, IDC_STOP_REC_BTN);
     g_statusControls.push_back(g_hStopRecBtn);
 
     // Version label at bottom
@@ -564,6 +570,10 @@ static LRESULT CALLBACK PanelWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
         else if (wmId == IDC_STOP_REC_BTN) {
             g_forceStopRecording = true;
             Log(L"[UI] Stop Recording button pressed");
+        }
+        else if (wmId == IDC_START_REC_BTN) {
+            g_forceStartRecording = true;
+            Log(L"[UI] Start Recording button pressed");
         }
         return 0;
     }

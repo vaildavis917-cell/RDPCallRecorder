@@ -18,7 +18,7 @@
 
 static const wchar_t* WINDOW_CLASS_NAME = L"RDPCallRecorderWndClass";
 static const wchar_t* APP_TITLE = L"RDP Call Recorder";
-static const wchar_t* APP_VERSION = L"2.6.1";
+static const wchar_t* APP_VERSION = L"2.6.3";
 static const wchar_t* GITHUB_REPO_OWNER = L"vaildavis917-cell";
 static const wchar_t* GITHUB_REPO_NAME = L"RDPCallRecorder";
 static const int UPDATE_CHECK_INTERVAL_HOURS = 6;
@@ -41,6 +41,7 @@ extern HANDLE g_hMutex;
 extern std::atomic<bool> g_running;
 extern std::atomic<int> g_activeRecordings;
 extern std::atomic<bool> g_forceStopRecording;
+extern std::atomic<bool> g_forceStartRecording;
 extern std::thread g_monitorThread;
 extern std::thread g_updateThread;
 extern UINT WM_OPEN_SETTINGS_MSG;

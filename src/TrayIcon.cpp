@@ -28,6 +28,19 @@ void UpdateTrayTooltip() {
 
 void RemoveTrayIcon() { Shell_NotifyIconW(NIM_DELETE, &g_nid); }
 
+void ShowTrayBalloon(const std::wstring& title, const std::wstring& msg) {
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_INFO;
+    wcsncpy_s(g_nid.szInfoTitle, title.c_str(), _TRUNCATE);
+    wcsncpy_s(g_nid.szInfo, msg.c_str(), _TRUNCATE);
+    g_nid.dwInfoFlags = NIIF_INFO;
+    g_nid.uTimeout = 3000;
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+    // Reset flags back
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.szInfo[0] = L'\0';
+    g_nid.szInfoTitle[0] = L'\0';
+}
+
 void ShowTrayMenu(HWND hWnd) {
     POINT pt;
     GetCursorPos(&pt);

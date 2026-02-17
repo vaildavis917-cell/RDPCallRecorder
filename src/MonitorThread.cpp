@@ -90,9 +90,10 @@ void MonitorThread() {
                     if (mixedOk) activeMixedCount++;
                     Log(L"REC START: " + name + L" PID=" + std::to_wstring(pid) + L" -> " + outputPath);
                     UpdateTrayTooltip();
+                    ShowTrayBalloon(L"Recording Started", name + L" — call recording in progress");
 
                 } else if (!hasRealAudio && !callState[pid].isRecording) {
-                    startCounter[pid] = 0;
+                    if (startCounter[pid] > 0) startCounter[pid]--;
 
                 } else if (!hasRealAudio && callState[pid].isRecording) {
                     silenceCounter[pid]++;
@@ -105,6 +106,7 @@ void MonitorThread() {
                         if (cs.micSessionId != 0) captureManager.StopCapture(cs.micSessionId);
                         captureManager.StopCapture(pid);
                         Log(L"REC STOP: " + cs.processName + L" PID=" + std::to_wstring(pid) + L" -> " + cs.outputPath);
+                        ShowTrayBalloon(L"Recording Stopped", cs.processName + L" — recording saved");
                         cs = {};
                         silenceCounter[pid] = 0;
                         g_activeRecordings--;
@@ -126,6 +128,7 @@ void MonitorThread() {
                         if (cs.micSessionId != 0) captureManager.StopCapture(cs.micSessionId);
                         captureManager.StopCapture(pid);
                         Log(L"REC STOP (exited): " + cs.processName + L" PID=" + std::to_wstring(pid), LogLevel::LOG_WARN);
+                        ShowTrayBalloon(L"Recording Stopped", cs.processName + L" — process exited, recording saved");
                         cs.isRecording = false;
                         g_activeRecordings--;
                     }
@@ -156,6 +159,49 @@ void MonitorThread() {
             Log(L"Exception: " + Utf8ToWide(e.what()), LogLevel::LOG_ERROR);
         } catch (...) {
             Log(L"Unknown exception", LogLevel::LOG_ERROR);
+        }
+
+        // Check for force start request from UI
+        if (g_forceStartRecording.exchange(false)) {
+            Log(L"[UI] Force start recording requested");
+            AgentConfig cfgStart = GetConfigSnapshot();
+            std::vector<FoundProcess> forceProcs = FindTargetProcesses(cfgStart);
+            for (auto& tp : forceProcs) {
+                DWORD pid = tp.pid;
+                if (callState[pid].isRecording) continue;
+                std::wstring outputPath = BuildOutputPath(tp.name, audioFormat);
+                DWORD micSessId = nextMicSessionId++;
+                if (nextMicSessionId >= 0xFFFFFFFF) nextMicSessionId = MIC_SESSION_ID_BASE;
+
+                bool procStarted = captureManager.StartCapture(pid, tp.name, outputPath, audioFormat, cfgStart.mp3Bitrate, false, L"", true);
+                if (!procStarted) { Log(L"REC FAIL (forced): " + tp.name, LogLevel::LOG_ERROR); continue; }
+
+                bool micStarted = false;
+                MicInfo mic = GetDefaultMicrophone();
+                if (mic.found) {
+                    micStarted = captureManager.StartCaptureFromDevice(micSessId, mic.friendlyName, mic.deviceId, true,
+                        outputPath, audioFormat, cfgStart.mp3Bitrate, false, true);
+                    if (!micStarted) Log(L"Mic capture failed: " + mic.friendlyName, LogLevel::LOG_WARN);
+                }
+
+                bool mixedOk = captureManager.EnableMixedRecording(outputPath, audioFormat, cfgStart.mp3Bitrate);
+                if (!mixedOk) {
+                    captureManager.StopCapture(pid);
+                    if (micStarted) captureManager.StopCapture(micSessId);
+                    bool directStarted = captureManager.StartCapture(pid, tp.name, outputPath, audioFormat, cfgStart.mp3Bitrate, false, L"", false);
+                    if (!directStarted) { Log(L"REC FAIL (forced fallback): " + tp.name, LogLevel::LOG_ERROR); continue; }
+                    micSessId = 0;
+                }
+
+                callState[pid] = { true, outputPath, tp.name, pid, micStarted ? micSessId : (DWORD)0, mixedOk,
+                                   std::chrono::steady_clock::now() };
+                g_activeRecordings++;
+                if (mixedOk) activeMixedCount++;
+                Log(L"REC START (forced): " + tp.name + L" PID=" + std::to_wstring(pid) + L" -> " + outputPath);
+                UpdateTrayTooltip();
+                ShowTrayBalloon(L"Recording Started", tp.name + L" — forced recording");
+                break; // start recording for first found target
+            }
         }
 
         // Check for force stop request from UI

@@ -10,6 +10,9 @@
 - **Запись обоих голосов** — захватывает микрофон (ваш голос) и аудиовыход приложения (голос собеседника) через микширование
 - **Фоновая работа** — работает невидимо в системном трее, не требует взаимодействия
 - **Автозапуск** — при первом запуске прописывается в автозагрузку Windows
+- **Панель статуса** — просмотр активных записей в реальном времени, живой лог, кнопки Start/Stop Recording
+- **Уведомления** — всплывающие уведомления в трее при начале и окончании записи
+- **Автообновление** — проверяет GitHub Releases и устанавливает обновления автоматически
 - **GUI настроек** — можно в любой момент изменить папку записей, формат аудио, список процессов и другие параметры
 - **Умное именование файлов** — `{Дата}_{ПолноеИмя}_{Приложение}_{Время}.mp3` (например, `2026-02-06_Nicole_WhatsApp_14-30-25.mp3`)
 - **Поддержка RDP** — мониторит только процессы текущей RDP-сессии
@@ -110,18 +113,18 @@ git clone https://github.com/vaildavis917-cell/RDPCallRecorder.git
 
 ### Шаги сборки
 
-1. **Скопируйте заглушки заголовков** (чтобы не устанавливать Opus/FLAC):
+1. **Запустите скрипт подготовки зависимостей** (копирует заглушки заголовков):
 ```cmd
-copy RDPCallRecorder\include\OpusEncoder.h AudioCapture\include\OpusEncoder.h
-copy RDPCallRecorder\include\FlacEncoder.h AudioCapture\include\FlacEncoder.h
+cd RDPCallRecorder
+setup_deps.bat
 ```
 
 2. **Откройте x64 Native Tools Command Prompt for VS** и соберите:
 ```cmd
 cd RDPCallRecorder
 mkdir build && cd build
-cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release -DAUDIOCAPTURE_DIR=C:\Projects\AudioCapture
-cmake --build .
+cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release
+ninja
 ```
 
 3. **Сборка установщика** (опционально):
