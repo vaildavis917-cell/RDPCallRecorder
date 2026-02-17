@@ -1,5 +1,12 @@
 # Changelog
 
+## v2.6.4 (2026-02-17)
+
+- **Fixed Telegram recording stop:** Telegram keeps audio session active with micro-peaks even after call ends. Implemented rolling average peak detection (window of 5 cycles) with Telegram-specific silence threshold (avg peak < 0.03). Recording now stops ~10 seconds after Telegram call ends without needing to close the app.
+- Unified silence detection logic: merged `hasRealAudio && isRecording` and `!hasRealAudio && isRecording` branches into a single `isRecording` block with per-app silence strategy
+- Added detailed Telegram debug logging (`[TG]` prefix) for peak levels and silence counter
+- Updated auto-update version to v2.6.4
+
 ## v2.6.3 (2026-02-17)
 
 - Added **Start Recording** button on Status tab for manual recording control

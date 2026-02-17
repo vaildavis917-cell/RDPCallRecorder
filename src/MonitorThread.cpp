@@ -12,8 +12,22 @@
 #include <roapi.h>
 #include <map>
 #include <set>
+#include <deque>
 #include <thread>
 #include <chrono>
+#include <algorithm>
+#include <numeric>
+
+// Telegram-specific silence detection constants
+static const float  TELEGRAM_SILENCE_PEAK_THRESHOLD = 0.03f;  // avg peak below this = silence
+static const int    TELEGRAM_PEAK_HISTORY_SIZE       = 5;      // rolling window size (cycles)
+static const int    TELEGRAM_SILENCE_CYCLES          = 5;      // cycles of low avg peak to stop (= 10s at 2s poll)
+
+static bool IsTelegramProcess(const std::wstring& name) {
+    std::wstring lower = name;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+    return lower.find(L"telegram") != std::wstring::npos;
+}
 
 void MonitorThread() {
     HRESULT hr = RoInitialize(RO_INIT_MULTITHREADED);
@@ -28,6 +42,7 @@ void MonitorThread() {
     std::map<DWORD, CallRecordingState> callState;
     std::map<DWORD, int> silenceCounter;
     std::map<DWORD, int> startCounter;
+    std::map<DWORD, std::deque<float>> peakHistory;  // rolling peak history per PID
     DWORD nextMicSessionId = MIC_SESSION_ID_BASE;
     int activeMixedCount = 0;
 
@@ -48,11 +63,21 @@ void MonitorThread() {
                 DWORD pid = tp.pid;
                 std::wstring name = tp.name;
                 currentPids.insert(pid);
-                bool hasRealAudio = audioMonitor.CheckProcessRealAudio(pid);
+
+                bool isTelegram = IsTelegramProcess(name);
+                float currentPeak = audioMonitor.GetProcessPeakLevel(pid);
+                bool hasRealAudio = (currentPeak > AUDIO_PEAK_THRESHOLD);
+
+                // Maintain rolling peak history for all processes (used for Telegram)
+                auto& history = peakHistory[pid];
+                history.push_back(currentPeak);
+                if ((int)history.size() > TELEGRAM_PEAK_HISTORY_SIZE)
+                    history.pop_front();
 
                 if (hasRealAudio && !callState[pid].isRecording) {
                     startCounter[pid]++;
                     Log(L"Audio detected: " + name + L" PID=" + std::to_wstring(pid) +
+                        L" peak=" + std::to_wstring(currentPeak) +
                         L" count=" + std::to_wstring(startCounter[pid]) + L"/" + std::to_wstring(config.startThreshold), LogLevel::LOG_DEBUG);
 
                     if (startCounter[pid] < config.startThreshold) continue;
@@ -95,25 +120,55 @@ void MonitorThread() {
                 } else if (!hasRealAudio && !callState[pid].isRecording) {
                     if (startCounter[pid] > 0) startCounter[pid]--;
 
-                } else if (!hasRealAudio && callState[pid].isRecording) {
-                    silenceCounter[pid]++;
-                    if (silenceCounter[pid] >= config.silenceThreshold) {
-                        auto& cs = callState[pid];
-                        if (cs.mixedEnabled) {
-                            activeMixedCount--;
-                            if (activeMixedCount <= 0) { captureManager.DisableMixedRecording(); activeMixedCount = 0; }
+                } else if (callState[pid].isRecording) {
+                    // ===== SILENCE DETECTION DURING RECORDING =====
+                    // For Telegram: use rolling average peak because Telegram keeps audio session
+                    // active with micro-peaks even when no call is in progress.
+                    // For other apps: use simple hasRealAudio check (peak > 0.01).
+
+                    bool isSilent = false;
+
+                    if (isTelegram) {
+                        // Calculate average peak over the rolling window
+                        float avgPeak = 0.0f;
+                        if (!history.empty()) {
+                            avgPeak = std::accumulate(history.begin(), history.end(), 0.0f) / (float)history.size();
                         }
-                        if (cs.micSessionId != 0) captureManager.StopCapture(cs.micSessionId);
-                        captureManager.StopCapture(pid);
-                        Log(L"REC STOP: " + cs.processName + L" PID=" + std::to_wstring(pid) + L" -> " + cs.outputPath);
-                        ShowTrayBalloon(L"Recording Stopped", cs.processName + L" — recording saved");
-                        cs = {};
-                        silenceCounter[pid] = 0;
-                        g_activeRecordings--;
-                        UpdateTrayTooltip();
+                        isSilent = (avgPeak < TELEGRAM_SILENCE_PEAK_THRESHOLD);
+
+                        Log(L"[TG] PID=" + std::to_wstring(pid) +
+                            L" peak=" + std::to_wstring(currentPeak) +
+                            L" avgPeak=" + std::to_wstring(avgPeak) +
+                            L" silent=" + (isSilent ? L"YES" : L"NO") +
+                            L" counter=" + std::to_wstring(silenceCounter[pid]) +
+                            L"/" + std::to_wstring(TELEGRAM_SILENCE_CYCLES), LogLevel::LOG_DEBUG);
+                    } else {
+                        isSilent = !hasRealAudio;
                     }
-                } else if (hasRealAudio && callState[pid].isRecording) {
-                    silenceCounter[pid] = 0;
+
+                    if (isSilent) {
+                        silenceCounter[pid]++;
+                        int threshold = isTelegram ? TELEGRAM_SILENCE_CYCLES : config.silenceThreshold;
+
+                        if (silenceCounter[pid] >= threshold) {
+                            auto& cs = callState[pid];
+                            if (cs.mixedEnabled) {
+                                activeMixedCount--;
+                                if (activeMixedCount <= 0) { captureManager.DisableMixedRecording(); activeMixedCount = 0; }
+                            }
+                            if (cs.micSessionId != 0) captureManager.StopCapture(cs.micSessionId);
+                            captureManager.StopCapture(pid);
+                            Log(L"REC STOP: " + cs.processName + L" PID=" + std::to_wstring(pid) + L" -> " + cs.outputPath);
+                            ShowTrayBalloon(L"Recording Stopped", cs.processName + L" — recording saved");
+                            cs = {};
+                            silenceCounter[pid] = 0;
+                            peakHistory.erase(pid);
+                            g_activeRecordings--;
+                            UpdateTrayTooltip();
+                        }
+                    } else {
+                        silenceCounter[pid] = 0;
+                    }
                 }
             }
 
@@ -135,7 +190,7 @@ void MonitorThread() {
                     toRemove.push_back(pid);
                 }
             }
-            for (DWORD p : toRemove) { callState.erase(p); silenceCounter.erase(p); startCounter.erase(p); }
+            for (DWORD p : toRemove) { callState.erase(p); silenceCounter.erase(p); startCounter.erase(p); peakHistory.erase(p); }
             UpdateTrayTooltip();
 
             // Push active recordings to shared StatusData for UI
@@ -222,6 +277,7 @@ void MonitorThread() {
             callState.clear();
             silenceCounter.clear();
             startCounter.clear();
+            peakHistory.clear();
             g_statusData.SetRecordings({});
             UpdateTrayTooltip();
         }

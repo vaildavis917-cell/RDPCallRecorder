@@ -85,6 +85,43 @@ bool AudioSessionMonitor::CheckProcessRealAudio(DWORD processId, float threshold
     return CheckSessionsOnDevice(m_cachedSessionManager, processId, threshold);
 }
 
+float AudioSessionMonitor::GetProcessPeakLevel(DWORD processId) {
+    if (!EnsureDefaultDeviceCached()) return 0.0f;
+    if (!m_cachedSessionManager) return 0.0f;
+
+    ComPtr<IAudioSessionEnumerator> sessionEnumerator;
+    if (FAILED(m_cachedSessionManager->GetSessionEnumerator(&sessionEnumerator)) || !sessionEnumerator) return 0.0f;
+
+    int sessionCount = 0;
+    sessionEnumerator->GetCount(&sessionCount);
+    float maxPeak = 0.0f;
+
+    for (int i = 0; i < sessionCount; i++) {
+        ComPtr<IAudioSessionControl> sessionControl;
+        if (FAILED(sessionEnumerator->GetSession(i, &sessionControl)) || !sessionControl) continue;
+
+        ComPtr<IAudioSessionControl2> sessionControl2;
+        if (SUCCEEDED(sessionControl.As(&sessionControl2))) {
+            DWORD sessionProcessId = 0;
+            if (SUCCEEDED(sessionControl2->GetProcessId(&sessionProcessId))) {
+                bool isMatch = (sessionProcessId == processId);
+                if (!isMatch && sessionProcessId != 0)
+                    isMatch = IsChildOfProcess(sessionProcessId, processId);
+
+                if (isMatch) {
+                    ComPtr<IAudioMeterInformation> meter;
+                    if (SUCCEEDED(sessionControl.As(&meter))) {
+                        float peakLevel = 0.0f;
+                        if (SUCCEEDED(meter->GetPeakValue(&peakLevel)) && peakLevel > maxPeak)
+                            maxPeak = peakLevel;
+                    }
+                }
+            }
+        }
+    }
+    return maxPeak;
+}
+
 bool AudioSessionMonitor::CheckSessionsOnDevice(ComPtr<IAudioSessionManager2>& sessionManager,
                                                   DWORD processId, float threshold) {
     if (!sessionManager) return false;

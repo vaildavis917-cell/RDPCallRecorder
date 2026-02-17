@@ -30,6 +30,7 @@ public:
     ~AudioSessionMonitor() = default;
 
     bool CheckProcessRealAudio(DWORD processId, float threshold = 0.01f);
+    float GetProcessPeakLevel(DWORD processId);
 
     struct DetectedSession {
         DWORD pid;
