@@ -21,6 +21,7 @@ NOTIFYICONDATAW g_nid = {};
 HANDLE g_hMutex = nullptr;
 std::atomic<bool> g_running(true);
 std::atomic<int> g_activeRecordings(0);
+std::atomic<bool> g_forceStopRecording(false);
 std::thread g_monitorThread;
 std::thread g_updateThread;
 UINT WM_OPEN_SETTINGS_MSG = 0;

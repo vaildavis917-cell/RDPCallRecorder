@@ -40,6 +40,7 @@ extern NOTIFYICONDATAW g_nid;
 extern HANDLE g_hMutex;
 extern std::atomic<bool> g_running;
 extern std::atomic<int> g_activeRecordings;
+extern std::atomic<bool> g_forceStopRecording;
 extern std::thread g_monitorThread;
 extern std::thread g_updateThread;
 extern UINT WM_OPEN_SETTINGS_MSG;

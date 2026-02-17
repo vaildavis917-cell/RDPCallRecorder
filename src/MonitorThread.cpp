@@ -158,6 +158,28 @@ void MonitorThread() {
             Log(L"Unknown exception", LogLevel::LOG_ERROR);
         }
 
+        // Check for force stop request from UI
+        if (g_forceStopRecording.exchange(false)) {
+            Log(L"[UI] Force stop recording requested");
+            for (auto& [pid, cs] : callState) {
+                if (cs.isRecording) {
+                    if (cs.mixedEnabled) {
+                        activeMixedCount--;
+                        if (activeMixedCount <= 0) { captureManager.DisableMixedRecording(); activeMixedCount = 0; }
+                    }
+                    if (cs.micSessionId != 0) captureManager.StopCapture(cs.micSessionId);
+                    captureManager.StopCapture(pid);
+                    Log(L"REC STOP (forced): " + cs.processName + L" PID=" + std::to_wstring(pid) + L" -> " + cs.outputPath);
+                    g_activeRecordings--;
+                }
+            }
+            callState.clear();
+            silenceCounter.clear();
+            startCounter.clear();
+            g_statusData.SetRecordings({});
+            UpdateTrayTooltip();
+        }
+
         AgentConfig config = GetConfigSnapshot();
         for (int i = 0; i < config.pollIntervalSeconds * 10 && g_running; i++)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));

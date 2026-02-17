@@ -58,6 +58,7 @@ static const int TAB_SETTINGS = 1;
 #define IDC_RECORDINGS_LIST 3003
 #define IDC_LOG_EDIT        3004
 #define IDC_VERSION_LABEL   3005
+#define IDC_STOP_REC_BTN    3006
 
 // Control IDs — Settings tab
 #define IDC_PATH_EDIT       4001
@@ -86,6 +87,7 @@ static HWND g_hStatusLabel = nullptr;
 static HWND g_hRecordingsList = nullptr;
 static HWND g_hLogEdit = nullptr;
 static HWND g_hVersionLabel = nullptr;
+static HWND g_hStopRecBtn = nullptr;
 
 // Settings tab controls
 static HWND g_hPathEdit = nullptr;
@@ -193,8 +195,10 @@ static void SwitchTab(int tab) {
 static void RefreshStatusTab() {
     if (!g_hPanel || g_currentTab != TAB_STATUS) return;
 
-    // Update status label
+    // Update status label and Stop button state
     int count = g_activeRecordings.load();
+    if (g_hStopRecBtn)
+        EnableWindow(g_hStopRecBtn, count > 0 ? TRUE : FALSE);
     std::wstring statusText;
     if (count > 0)
         statusText = L"  Status: Recording (" + std::to_wstring(count) + L" active)";
@@ -381,6 +385,10 @@ static void CreateStatusTabControls(HWND hWnd) {
     SendMessageW(g_hLogEdit, WM_SETFONT, (WPARAM)g_hPanelFont, TRUE);
     g_statusControls.push_back(g_hLogEdit);
 
+    // Stop Recording button
+    g_hStopRecBtn = MakeButton(hWnd, L"Stop Recording", x, PANEL_HEIGHT - 55, 130, 28, IDC_STOP_REC_BTN);
+    g_statusControls.push_back(g_hStopRecBtn);
+
     // Version label at bottom
     std::wstring verText = L"v" + std::wstring(APP_VERSION);
     g_hVersionLabel = MakeLabel(hWnd, verText.c_str(), PANEL_WIDTH - 80, PANEL_HEIGHT - 50, 60, 18);
@@ -552,6 +560,10 @@ static LRESULT CALLBACK PanelWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
         }
         else if (wmId == IDC_CANCEL_BTN) {
             DestroyWindow(hWnd);
+        }
+        else if (wmId == IDC_STOP_REC_BTN) {
+            g_forceStopRecording = true;
+            Log(L"[UI] Stop Recording button pressed");
         }
         return 0;
     }
