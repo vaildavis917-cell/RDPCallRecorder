@@ -114,7 +114,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     Log(L"Recording path: " + GetConfigSnapshot().recordingPath);
 
     // Show balloon notification so user knows the app is running
-    ShowTrayBalloon(L"RDP Call Recorder", L"v" + std::wstring(APP_VERSION) + L" — Running");
+    ShowTrayBalloon(L"RDP Call Recorder", L"v" + std::wstring(APP_VERSION) + L" - Running");
 
     if (firstLaunch) {
         ShowSettingsDialog(g_hWndMain);
