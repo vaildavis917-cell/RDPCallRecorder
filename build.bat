@@ -14,21 +14,15 @@ set "INSTALLER_DIR=%PROJECT_DIR%installer"
 set "AUDIOCAPTURE_DIR=C:\Users\User\Documents\Projects\AudioCapture"
 set "NSIS_PATH=C:\Program Files (x86)\NSIS\makensis.exe"
 
-:: --- Colors ---
-set "STEP=[36m"
-set "OK=[32m"
-set "ERR=[31m"
-set "RESET=[0m"
-
 echo.
-echo %STEP%========================================%RESET%
-echo %STEP% RDPCallRecorder Auto-Build%RESET%
-echo %STEP%========================================%RESET%
+echo ========================================
+echo  RDPCallRecorder Auto-Build
+echo ========================================
 echo.
 
 :: --- Check AudioCapture ---
 if not exist "%AUDIOCAPTURE_DIR%\include\AudioCapture.h" (
-    echo %ERR%ERROR: AudioCapture not found at: %AUDIOCAPTURE_DIR%%RESET%
+    echo [ERROR] AudioCapture not found at: %AUDIOCAPTURE_DIR%
     echo.
     echo Clone it next to the project directory:
     echo   git clone https://github.com/masonasons/AudioCapture.git
@@ -36,40 +30,42 @@ if not exist "%AUDIOCAPTURE_DIR%\include\AudioCapture.h" (
     echo Or edit AUDIOCAPTURE_DIR in this script.
     exit /b 1
 )
-echo %OK%[OK]%RESET% AudioCapture found
+echo [OK] AudioCapture found
 
 :: --- Check NSIS ---
-if not exist "%NSIS_PATH%" (
-    :: Try alternative path
-    set "NSIS_PATH=C:\Program Files\NSIS\makensis.exe"
-)
-if not exist "!NSIS_PATH!" (
-    echo %ERR%WARNING: NSIS not found. Installer will not be built.%RESET%
-    echo Download from: https://nsis.sourceforge.io/Download
-    set "HAS_NSIS=0"
-) else (
-    echo %OK%[OK]%RESET% NSIS found
+set "HAS_NSIS=0"
+if exist "%NSIS_PATH%" (
     set "HAS_NSIS=1"
+    echo [OK] NSIS found
+) else (
+    set "NSIS_PATH=C:\Program Files\NSIS\makensis.exe"
+    if exist "!NSIS_PATH!" (
+        set "HAS_NSIS=1"
+        echo [OK] NSIS found
+    ) else (
+        echo [WARN] NSIS not found. Installer will not be built.
+        echo Download from: https://nsis.sourceforge.io/Download
+    )
 )
 
 :: --- Git pull ---
 echo.
-echo %STEP%[1/5] Git pull...%RESET%
+echo [1/5] Git pull...
 cd /d "%PROJECT_DIR%"
 git pull
 if %ERRORLEVEL% neq 0 (
-    echo %ERR%WARNING: git pull failed, building from local files%RESET%
+    echo [WARN] git pull failed, building from local files
 )
 
 :: --- Clean build if requested ---
 if /i "%~1"=="clean" (
     echo.
-    echo %STEP%[2/5] Cleaning build directory...%RESET%
+    echo [2/5] Cleaning build directory...
     if exist "%BUILD_DIR%" rd /s /q "%BUILD_DIR%"
-    echo %OK%[OK]%RESET% Build directory cleaned
+    echo [OK] Build directory cleaned
 ) else (
     echo.
-    echo %STEP%[2/5] Incremental build (use "build.bat clean" for full rebuild)%RESET%
+    echo [2/5] Incremental build (use "build.bat clean" for full rebuild)
 )
 
 :: --- CMake configure ---
@@ -78,62 +74,62 @@ cd /d "%BUILD_DIR%"
 
 if not exist "build.ninja" (
     echo.
-    echo %STEP%[3/5] CMake configure...%RESET%
+    echo [3/5] CMake configure...
     cmake .. -G "Ninja" -DCMAKE_BUILD_TYPE=Release -DAUDIOCAPTURE_DIR="%AUDIOCAPTURE_DIR%"
     if !ERRORLEVEL! neq 0 (
-        echo %ERR%ERROR: CMake configure failed%RESET%
+        echo [ERROR] CMake configure failed
         exit /b 1
     )
-    echo %OK%[OK]%RESET% CMake configured
+    echo [OK] CMake configured
 ) else (
     echo.
-    echo %STEP%[3/5] CMake already configured (skipping)%RESET%
+    echo [3/5] CMake already configured (skipping)
 )
 
 :: --- Build ---
 echo.
-echo %STEP%[4/5] Building with Ninja...%RESET%
+echo [4/5] Building with Ninja...
 ninja
 if %ERRORLEVEL% neq 0 (
     echo.
-    echo %ERR%ERROR: Build failed!%RESET%
+    echo [ERROR] Build failed!
     exit /b 1
 )
-echo %OK%[OK]%RESET% Build successful
+echo [OK] Build successful
 
 :: --- Verify exe exists ---
 if not exist "%BUILD_DIR%\bin\RDPCallRecorder.exe" (
-    echo %ERR%ERROR: RDPCallRecorder.exe not found in bin\%RESET%
+    echo [ERROR] RDPCallRecorder.exe not found in bin\
     exit /b 1
 )
 
 :: --- Copy exe to installer ---
 echo.
-echo %STEP%[5/5] Building installer...%RESET%
+echo [5/5] Building installer...
 if not exist "%INSTALLER_DIR%\files" md "%INSTALLER_DIR%\files"
 xcopy "%BUILD_DIR%\bin\RDPCallRecorder.exe" "%INSTALLER_DIR%\files\" /Y >NUL
-echo %OK%[OK]%RESET% Copied RDPCallRecorder.exe to installer\files\
+echo [OK] Copied RDPCallRecorder.exe to installer\files\
 
 :: --- Build NSIS installer ---
-if "%HAS_NSIS%"=="1" (
+if "!HAS_NSIS!"=="1" (
     "!NSIS_PATH!" "%INSTALLER_DIR%\installer.nsi"
     if !ERRORLEVEL! neq 0 (
-        echo %ERR%ERROR: NSIS build failed%RESET%
+        echo [ERROR] NSIS build failed
         exit /b 1
     )
-    echo %OK%[OK]%RESET% Installer built: %INSTALLER_DIR%\RDPCallRecorder_Setup.exe
+    echo [OK] Installer built successfully
 ) else (
-    echo %ERR%[SKIP]%RESET% NSIS not installed, skipping installer build
+    echo [SKIP] NSIS not installed, skipping installer build
 )
 
 :: --- Done ---
 echo.
-echo %STEP%========================================%RESET%
-echo %OK% BUILD COMPLETE!%RESET%
-echo %STEP%========================================%RESET%
+echo ========================================
+echo  BUILD COMPLETE!
+echo ========================================
 echo.
 echo   EXE:       %BUILD_DIR%\bin\RDPCallRecorder.exe
-if "%HAS_NSIS%"=="1" (
+if "!HAS_NSIS!"=="1" (
     echo   Installer: %INSTALLER_DIR%\RDPCallRecorder_Setup.exe
 )
 echo.
