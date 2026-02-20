@@ -16,7 +16,7 @@ static std::wofstream g_logFile;
 static std::wstring g_logFilePath;
 static std::mutex g_logMutex;
 
-// Log directory is next to the exe: {ExeDir}\logs\
+// Log directory is next to the exe: {ExeDir}/logs/
 static fs::path GetLogDir() {
     return fs::path(GetExePath()).parent_path() / L"logs";
 }
