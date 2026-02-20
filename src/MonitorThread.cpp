@@ -118,7 +118,12 @@ void MonitorThread() {
                             if (hasRealAudio && !telegramCallActive) {
                                 Log(L"[TG] Audio but NO call window: PID=" + std::to_wstring(pid) +
                                     L" peak=" + std::to_wstring(currentPeak) +
-                                    L" — ignoring (notification/voice msg)", LogLevel::LOG_DEBUG);
+                                    L" - ignoring (notification/voice msg)", LogLevel::LOG_DEBUG);
+                            } else if (!hasRealAudio && telegramCallActive) {
+                                Log(L"[TG] Call window YES but NO audio: PID=" + std::to_wstring(pid) +
+                                    L" peak=" + std::to_wstring(currentPeak) +
+                                    L" sessionActive=" + (sessionActive ? L"YES" : L"NO") +
+                                    L" - waiting for audio stream", LogLevel::LOG_DEBUG);
                             }
                         }
                     } else {

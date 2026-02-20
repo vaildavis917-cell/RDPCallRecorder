@@ -45,6 +45,10 @@ bool LoadConfig(AgentConfig& config) {
     std::lock_guard<std::mutex> lock(g_configMutex);
 
     config.recordingPath = GetIniString(L"Recording", L"RecordingPath", config.recordingPath, iniPath);
+    // If INI has empty RecordingPath=, fall back to default
+    if (config.recordingPath.empty()) {
+        config.recordingPath = GetDefaultRecordingPath();
+    }
     config.audioFormat   = GetIniString(L"Recording", L"AudioFormat", config.audioFormat, iniPath);
 
     int rawBitrate = GetIniInt(L"Recording", L"MP3Bitrate", static_cast<int>(config.mp3Bitrate), iniPath);
