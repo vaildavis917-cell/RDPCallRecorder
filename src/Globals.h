@@ -18,7 +18,7 @@
 
 static const wchar_t* WINDOW_CLASS_NAME = L"RDPCallRecorderWndClass";
 static const wchar_t* APP_TITLE = L"RDP Call Recorder";
-static const wchar_t* APP_VERSION = L"2.6.6";
+static const wchar_t* APP_VERSION = L"2.6.7";
 static const wchar_t* GITHUB_REPO_OWNER = L"vaildavis917-cell";
 static const wchar_t* GITHUB_REPO_NAME = L"RDPCallRecorder";
 static const int UPDATE_CHECK_INTERVAL_HOURS = 6;
