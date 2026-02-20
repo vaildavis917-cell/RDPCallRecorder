@@ -49,6 +49,17 @@ bool LoadConfig(AgentConfig& config) {
     if (config.recordingPath.empty()) {
         config.recordingPath = GetDefaultRecordingPath();
     }
+    // Sanitize recording path: trim trailing spaces/dots from each path segment
+    // Windows does not allow directory names ending with spaces or dots
+    {
+        fs::path sanitized;
+        for (const auto& part : fs::path(config.recordingPath)) {
+            std::wstring seg = part.wstring();
+            while (!seg.empty() && (seg.back() == L' ' || seg.back() == L'.')) seg.pop_back();
+            if (!seg.empty()) sanitized /= seg;
+        }
+        config.recordingPath = sanitized.wstring();
+    }
     config.audioFormat   = GetIniString(L"Recording", L"AudioFormat", config.audioFormat, iniPath);
 
     int rawBitrate = GetIniInt(L"Recording", L"MP3Bitrate", static_cast<int>(config.mp3Bitrate), iniPath);
