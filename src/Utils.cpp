@@ -40,18 +40,63 @@ std::vector<std::wstring> SplitString(const std::wstring& str, wchar_t delimiter
     return tokens;
 }
 
+static bool IsWhitespaceOrInvisible(wchar_t ch) {
+    // Standard ASCII whitespace
+    if (ch == L' ' || ch == L'\t' || ch == L'\r' || ch == L'\n') return true;
+    // Unicode whitespace and invisible characters
+    if (ch == 0x00A0) return true;  // Non-breaking space
+    if (ch == 0x2000) return true;  // En quad
+    if (ch == 0x2001) return true;  // Em quad
+    if (ch == 0x2002) return true;  // En space
+    if (ch == 0x2003) return true;  // Em space
+    if (ch == 0x2004) return true;  // Three-per-em space
+    if (ch == 0x2005) return true;  // Four-per-em space
+    if (ch == 0x2006) return true;  // Six-per-em space
+    if (ch == 0x2007) return true;  // Figure space
+    if (ch == 0x2008) return true;  // Punctuation space
+    if (ch == 0x2009) return true;  // Thin space
+    if (ch == 0x200A) return true;  // Hair space
+    if (ch == 0x200B) return true;  // Zero-width space
+    if (ch == 0x200C) return true;  // Zero-width non-joiner
+    if (ch == 0x200D) return true;  // Zero-width joiner
+    if (ch == 0x200E) return true;  // Left-to-right mark
+    if (ch == 0x200F) return true;  // Right-to-left mark
+    if (ch == 0x202F) return true;  // Narrow no-break space
+    if (ch == 0x205F) return true;  // Medium mathematical space
+    if (ch == 0x2060) return true;  // Word joiner
+    if (ch == 0x3000) return true;  // Ideographic space
+    if (ch == 0xFEFF) return true;  // BOM / zero-width no-break space
+    return false;
+}
+
 std::wstring SanitizeForPath(const std::wstring& name) {
     std::wstring result;
     for (wchar_t ch : name) {
         if (ch == L'\\' || ch == L'/' || ch == L':' || ch == L'*' ||
             ch == L'?' || ch == L'"' || ch == L'<' || ch == L'>' || ch == L'|') {
             result += L'_';
+        } else if (IsWhitespaceOrInvisible(ch) && ch != L' ') {
+            // Replace Unicode whitespace with regular space (except normal space)
+            result += L' ';
         } else {
             result += ch;
         }
     }
-    while (!result.empty() && result.front() == L'.') result.erase(result.begin());
+    while (!result.empty() && (result.front() == L'.' || result.front() == L' ')) result.erase(result.begin());
     while (!result.empty() && (result.back() == L' ' || result.back() == L'.')) result.pop_back();
+    // Collapse multiple consecutive spaces into one
+    std::wstring collapsed;
+    bool lastWasSpace = false;
+    for (wchar_t ch : result) {
+        if (ch == L' ') {
+            if (!lastWasSpace) collapsed += ch;
+            lastWasSpace = true;
+        } else {
+            collapsed += ch;
+            lastWasSpace = false;
+        }
+    }
+    result = collapsed;
     if (result.empty()) result = L"Unknown";
     return result;
 }
