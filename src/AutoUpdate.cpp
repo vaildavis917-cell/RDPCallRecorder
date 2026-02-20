@@ -79,63 +79,122 @@ static std::wstring WinHttpGet(const std::wstring& host, const std::wstring& pat
     return result;
 }
 
+// Download file with manual redirect handling (GitHub redirects to objects.githubusercontent.com)
 static bool WinHttpDownloadFile(const std::wstring& url, const std::wstring& localPath) {
-    URL_COMPONENTS urlComp = {};
-    urlComp.dwStructSize = sizeof(urlComp);
-    wchar_t hostBuf[256] = {}, pathBuf[2048] = {};
-    urlComp.lpszHostName = hostBuf; urlComp.dwHostNameLength = 256;
-    urlComp.lpszUrlPath = pathBuf; urlComp.dwUrlPathLength = 2048;
+    std::wstring currentUrl = url;
+    int maxRedirects = 5;
 
-    if (!WinHttpCrackUrl(url.c_str(), (DWORD)url.length(), 0, &urlComp)) return false;
+    for (int redirect = 0; redirect < maxRedirects; redirect++) {
+        URL_COMPONENTS urlComp = {};
+        urlComp.dwStructSize = sizeof(urlComp);
+        wchar_t hostBuf[256] = {}, pathBuf[4096] = {};
+        urlComp.lpszHostName = hostBuf; urlComp.dwHostNameLength = 256;
+        urlComp.lpszUrlPath = pathBuf; urlComp.dwUrlPathLength = 4096;
 
-    HINTERNET hSession = WinHttpOpen(L"RDPCallRecorder-AutoUpdate/1.0",
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) return false;
+        if (!WinHttpCrackUrl(currentUrl.c_str(), (DWORD)currentUrl.length(), 0, &urlComp)) {
+            Log(L"[UPDATE] Failed to parse URL: " + currentUrl, LogLevel::LOG_ERROR);
+            return false;
+        }
 
-    HINTERNET hConnect = WinHttpConnect(hSession, urlComp.lpszHostName, urlComp.nPort, 0);
-    if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
+        HINTERNET hSession = WinHttpOpen(L"RDPCallRecorder-AutoUpdate/1.0",
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!hSession) return false;
 
-    DWORD flags = (urlComp.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", urlComp.lpszUrlPath,
-        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
+        HINTERNET hConnect = WinHttpConnect(hSession, urlComp.lpszHostName, urlComp.nPort, 0);
+        if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
 
-    DWORD optionValue = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
-    WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &optionValue, sizeof(optionValue));
+        DWORD flags = (urlComp.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", urlComp.lpszUrlPath,
+            nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+        if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
 
-    if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-        !WinHttpReceiveResponse(hRequest, nullptr)) {
+        // Disable automatic redirects — handle them manually to support cross-host redirects
+        DWORD optionValue = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+        WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &optionValue, sizeof(optionValue));
+
+        if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+            !WinHttpReceiveResponse(hRequest, nullptr)) {
+            WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+            return false;
+        }
+
+        DWORD statusCode = 0, statusSize = sizeof(statusCode);
+        WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+
+        // Handle redirects (301, 302, 303, 307, 308)
+        if (statusCode >= 300 && statusCode < 400) {
+            wchar_t locationBuf[4096] = {};
+            DWORD locationSize = sizeof(locationBuf);
+            if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_LOCATION,
+                WINHTTP_HEADER_NAME_BY_INDEX, locationBuf, &locationSize, WINHTTP_NO_HEADER_INDEX)) {
+                currentUrl = locationBuf;
+                Log(L"[UPDATE] Redirect " + std::to_wstring(statusCode) + L" -> " + currentUrl);
+            } else {
+                Log(L"[UPDATE] Redirect without Location header", LogLevel::LOG_ERROR);
+                WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+                return false;
+            }
+            WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+            continue; // Follow redirect
+        }
+
+        if (statusCode != 200) {
+            Log(L"[UPDATE] Download HTTP " + std::to_wstring(statusCode), LogLevel::LOG_ERROR);
+            WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+            return false;
+        }
+
+        // Status 200 — download the file
+        HANDLE hFile = CreateFileW(localPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+            return false;
+        }
+
+        char buffer[8192];
+        DWORD bytesRead = 0, bytesWritten = 0;
+        DWORD totalBytes = 0;
+        bool ok = true;
+        while (WinHttpReadData(hRequest, buffer, sizeof(buffer), &bytesRead) && bytesRead > 0) {
+            if (!WriteFile(hFile, buffer, bytesRead, &bytesWritten, nullptr)) { ok = false; break; }
+            totalBytes += bytesRead;
+        }
+
+        CloseHandle(hFile);
         WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
-        return false;
+
+        Log(L"[UPDATE] Downloaded " + std::to_wstring(totalBytes) + L" bytes");
+
+        // Verify downloaded file is a valid PE executable (starts with "MZ")
+        if (ok && totalBytes > 1024) {
+            HANDLE hVerify = CreateFileW(localPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (hVerify != INVALID_HANDLE_VALUE) {
+                char header[2] = {};
+                DWORD headerRead = 0;
+                ReadFile(hVerify, header, 2, &headerRead, nullptr);
+                CloseHandle(hVerify);
+                if (headerRead < 2 || header[0] != 'M' || header[1] != 'Z') {
+                    Log(L"[UPDATE] Downloaded file is not a valid executable (no MZ header)", LogLevel::LOG_ERROR);
+                    DeleteFileW(localPath.c_str());
+                    return false;
+                }
+            }
+        } else if (totalBytes <= 1024) {
+            Log(L"[UPDATE] Downloaded file too small (" + std::to_wstring(totalBytes) + L" bytes)", LogLevel::LOG_ERROR);
+            DeleteFileW(localPath.c_str());
+            return false;
+        }
+
+        return ok;
     }
 
-    DWORD statusCode = 0, statusSize = sizeof(statusCode);
-    WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
-    if (statusCode != 200) {
-        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
-        return false;
-    }
-
-    HANDLE hFile = CreateFileW(localPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
-        return false;
-    }
-
-    char buffer[8192];
-    DWORD bytesRead = 0, bytesWritten = 0;
-    bool ok = true;
-    while (WinHttpReadData(hRequest, buffer, sizeof(buffer), &bytesRead) && bytesRead > 0)
-        if (!WriteFile(hFile, buffer, bytesRead, &bytesWritten, nullptr)) { ok = false; break; }
-
-    CloseHandle(hFile);
-    WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
-    return ok;
+    Log(L"[UPDATE] Too many redirects", LogLevel::LOG_ERROR);
+    return false;
 }
 
 // Create a helper .bat script that:
-// 1. Waits for the current process to exit
+// 1. Waits for the current process to exit (by PID, not process name!)
 // 2. Runs the installer silently
 // 3. Restarts the app
 // 4. Cleans up after itself
@@ -151,22 +210,30 @@ static bool CreateUpdateBat(const std::wstring& batPath, const std::wstring& ins
     WideCharToMultiByte(CP_ACP, 0, batPath.c_str(), -1, batNarrow, MAX_PATH, nullptr, nullptr);
 
     f << "@echo off\r\n";
-    f << "echo Waiting for RDP Call Recorder to close...\r\n";
+    f << "echo Waiting for RDP Call Recorder (PID " << currentPid << ") to close...\r\n";
     // Wait for the current process to exit (poll every 1 second, max 30 seconds)
+    f << "set /a WAIT_COUNT=0\r\n";
     f << ":waitloop\r\n";
     f << "tasklist /FI \"PID eq " << currentPid << "\" 2>NUL | find /I \"" << currentPid << "\" >NUL\r\n";
     f << "if %ERRORLEVEL%==0 (\r\n";
+    f << "    set /a WAIT_COUNT+=1\r\n";
+    f << "    if %WAIT_COUNT% GEQ 30 goto forcekill\r\n";
     f << "    timeout /t 1 /nobreak >NUL\r\n";
     f << "    goto waitloop\r\n";
     f << ")\r\n";
-    // Force kill as safety net in case graceful shutdown didn't work
-    f << "taskkill /F /IM RDPCallRecorder.exe >NUL 2>&1\r\n";
+    f << "goto doinstall\r\n";
+    // Force kill ONLY our PID as safety net (not all instances!)
+    f << ":forcekill\r\n";
+    f << "echo Force killing PID " << currentPid << "...\r\n";
+    f << "taskkill /F /PID " << currentPid << " >NUL 2>&1\r\n";
     f << "timeout /t 2 /nobreak >NUL\r\n";
+    // Install
+    f << ":doinstall\r\n";
     f << "echo Installing update...\r\n";
     f << "\"" << installerNarrow << "\" /S\r\n";
     // Wait for installer to finish
     f << "echo Starting RDP Call Recorder...\r\n";
-    f << "timeout /t 2 /nobreak >NUL\r\n";
+    f << "timeout /t 3 /nobreak >NUL\r\n";
     f << "start \"\" \"" << exeNarrow << "\"\r\n";
     // Clean up
     f << "del \"" << installerNarrow << "\" >NUL 2>&1\r\n";
