@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(RDPCallRecorder VERSION 2.6.4 LANGUAGES CXX)
+project(RDPCallRecorder VERSION 2.6.5 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -26,6 +26,7 @@ set(SOURCES
     src/SettingsDialog.cpp
     src/MainPanel.cpp
     src/AutoUpdate.cpp
+    src/WindowUtils.cpp
     ${AUDIOCAPTURE_DIR}/src/AudioCapture.cpp
     ${AUDIOCAPTURE_DIR}/src/ProcessEnumerator.cpp
     ${AUDIOCAPTURE_DIR}/src/CaptureManager.cpp

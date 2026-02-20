@@ -68,6 +68,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
     LoadConfig(g_config);
     g_logLevel = ParseLogLevel(g_config.logLevel);
+    InitLogger();  // Create logs folder and open log file immediately
     bool firstLaunch = IsFirstLaunch();
 
     HWND hConsole = GetConsoleWindow();

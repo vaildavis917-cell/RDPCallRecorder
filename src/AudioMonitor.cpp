@@ -122,6 +122,56 @@ float AudioSessionMonitor::GetProcessPeakLevel(DWORD processId) {
     return maxPeak;
 }
 
+bool AudioSessionMonitor::IsSessionActive(DWORD processId) {
+    if (!EnsureEnumeratorInitialized()) return false;
+
+    ComPtr<IMMDeviceCollection> deviceCollection;
+    if (FAILED(m_deviceEnumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &deviceCollection)) || !deviceCollection)
+        return false;
+
+    UINT deviceCount = 0;
+    deviceCollection->GetCount(&deviceCount);
+
+    for (UINT d = 0; d < deviceCount; d++) {
+        ComPtr<IMMDevice> device;
+        if (FAILED(deviceCollection->Item(d, &device)) || !device) continue;
+
+        ComPtr<IAudioSessionManager2> sessionManager;
+        if (FAILED(device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL,
+            nullptr, reinterpret_cast<void**>(sessionManager.GetAddressOf()))) || !sessionManager) continue;
+
+        ComPtr<IAudioSessionEnumerator> sessionEnumerator;
+        if (FAILED(sessionManager->GetSessionEnumerator(&sessionEnumerator)) || !sessionEnumerator) continue;
+
+        int sessionCount = 0;
+        sessionEnumerator->GetCount(&sessionCount);
+
+        for (int i = 0; i < sessionCount; i++) {
+            ComPtr<IAudioSessionControl> sessionControl;
+            if (FAILED(sessionEnumerator->GetSession(i, &sessionControl)) || !sessionControl) continue;
+
+            ComPtr<IAudioSessionControl2> sessionControl2;
+            if (!SUCCEEDED(sessionControl.As(&sessionControl2))) continue;
+
+            DWORD sessionPid = 0;
+            if (!SUCCEEDED(sessionControl2->GetProcessId(&sessionPid)) || sessionPid == 0) continue;
+
+            bool isMatch = (sessionPid == processId);
+            if (!isMatch && sessionPid != 0)
+                isMatch = IsChildOfProcess(sessionPid, processId);
+
+            if (isMatch) {
+                AudioSessionState state;
+                if (SUCCEEDED(sessionControl->GetState(&state))) {
+                    if (state == AudioSessionStateActive)
+                        return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 bool AudioSessionMonitor::CheckSessionsOnDevice(ComPtr<IAudioSessionManager2>& sessionManager,
                                                   DWORD processId, float threshold) {
     if (!sessionManager) return false;

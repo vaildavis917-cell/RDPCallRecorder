@@ -16,6 +16,11 @@ static std::wofstream g_logFile;
 static std::wstring g_logFilePath;
 static std::mutex g_logMutex;
 
+// Log directory is next to the exe: {ExeDir}\logs\
+static fs::path GetLogDir() {
+    return fs::path(GetExePath()).parent_path() / L"logs";
+}
+
 static void EnsureLogFileOpen(const fs::path& logDir) {
     fs::path logFile = logDir / L"agent.log";
     std::wstring logPath = logFile.wstring();
@@ -42,6 +47,20 @@ static void EnsureLogFileOpen(const fs::path& logDir) {
         try { fs::create_directories(logDir); } catch (...) {}
         g_logFile.open(logPath, std::ios::app);
         g_logFilePath = logPath;
+    }
+}
+
+void InitLogger() {
+    // Create log directory and open log file immediately at startup
+    // Logs are stored next to the exe: {InstallDir}\logs\agent.log
+    try {
+        fs::path logDir = GetLogDir();
+        fs::create_directories(logDir);
+
+        std::lock_guard<std::mutex> lock(g_logMutex);
+        EnsureLogFileOpen(logDir);
+    } catch (...) {
+        // Silently fail — Log() will retry later
     }
 }
 
@@ -74,7 +93,7 @@ void Log(const std::wstring& message, LogLevel level) {
     g_statusData.PushLogLine(logLine);
 
     std::lock_guard<std::mutex> lock(g_logMutex);
-    fs::path logDir = fs::path(config.recordingPath) / SanitizeForPath(GetCurrentFullName()) / L"logs";
+    fs::path logDir = GetLogDir();
     try {
         EnsureLogFileOpen(logDir);
         if (g_logFile.is_open()) {

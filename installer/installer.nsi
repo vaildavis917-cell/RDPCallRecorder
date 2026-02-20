@@ -1,6 +1,6 @@
 ; ============================================================
 ; RDP Call Recorder - NSIS Installer Script
-; Version: 2.6.4
+; Version: 2.6.5
 ; User-level installation (no admin rights required)
 ; ============================================================
 ; Build instructions:
@@ -21,11 +21,11 @@ RequestExecutionLevel user
 Unicode true
 
 ; --- Metadata ---
-VIProductVersion "2.6.4.0"
+VIProductVersion "2.6.5.0"
 VIAddVersionKey "ProductName" "RDP Call Recorder"
 VIAddVersionKey "CompanyName" "QC Department"
 VIAddVersionKey "FileDescription" "Call Recording Agent for RDP Sessions"
-VIAddVersionKey "FileVersion" "2.6.4"
+VIAddVersionKey "FileVersion" "2.6.5"
 VIAddVersionKey "LegalCopyright" "Internal Use Only"
 
 ; --- Interface ---
@@ -67,6 +67,9 @@ Section "Install"
     File "files\config.ini"
     File "app.ico"
 
+    ; Create logs folder
+    CreateDirectory "$INSTDIR\logs"
+
     ; Save install path to registry (HKCU - user level)
     WriteRegStr HKCU "Software\RDPCallRecorder" "InstallDir" "$INSTDIR"
 
@@ -100,7 +103,7 @@ Section "Install"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
         "InstallLocation" "$INSTDIR"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
-        "DisplayVersion" "2.6.4"
+        "DisplayVersion" "2.6.5"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
         "Publisher" "QC Department"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\RDPCallRecorder" \
@@ -137,6 +140,12 @@ Section "Uninstall"
     Delete "$INSTDIR\config.ini"
     Delete "$INSTDIR\app.ico"
     Delete "$INSTDIR\Uninstall.exe"
+
+    ; Remove logs folder
+    Delete "$INSTDIR\logs\agent.log.old"
+    Delete "$INSTDIR\logs\agent.log"
+    RMDir "$INSTDIR\logs"
+
     RMDir "$INSTDIR"
 
     ; Remove registry keys (HKCU)

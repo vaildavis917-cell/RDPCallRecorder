@@ -5,6 +5,7 @@
 #include "Globals.h"
 #include "ProcessUtils.h"
 #include "AudioMonitor.h"
+#include "WindowUtils.h"
 #include "TrayIcon.h"
 #include "MainPanel.h"
 #include "CaptureManager.h"
@@ -18,11 +19,25 @@
 #include <algorithm>
 #include <numeric>
 
-// Telegram-specific silence detection:
-// Parameters are loaded from config.ini [Monitoring] section:
-//   TelegramSilencePeakThreshold (default 0.03)
-//   TelegramPeakHistorySize (default 5)
-//   TelegramSilenceCycles (default 5)
+// ============================================================
+// Call detection strategy (hybrid approach):
+//
+// START recording:
+//   - Telegram: audio peak detected + IsTelegramInCall() (window title check)
+//   - Other apps: audio peak detected (startThreshold cycles)
+//
+// STOP recording (key change — no more peak-based silence!):
+//   - Telegram: IsTelegramInCall() returns false (call window closed)
+//   - Other apps: AudioSessionState becomes Inactive (Windows reports session ended)
+//   - Safety net: MinRecordingSeconds — first N seconds never stop
+//   - Fallback: SilenceThreshold still used if session stays Active but no audio
+//     for a very long time (e.g. app bug keeps session active after call)
+//
+// This eliminates recording fragmentation because:
+//   - AudioSessionState stays Active for the entire call duration
+//   - Pauses in conversation do NOT change session state
+//   - Session becomes Inactive only when the call truly ends
+// ============================================================
 
 static bool IsTelegramProcess(const std::wstring& name) {
     std::wstring lower = name;
@@ -41,9 +56,10 @@ void MonitorThread() {
     AudioSessionMonitor audioMonitor;
 
     std::map<DWORD, CallRecordingState> callState;
-    std::map<DWORD, int> silenceCounter;
+    std::map<DWORD, int> silenceCounter;     // fallback silence counter
+    std::map<DWORD, int> inactiveCounter;    // session inactive counter
     std::map<DWORD, int> startCounter;
-    std::map<DWORD, std::deque<float>> peakHistory;  // rolling peak history per PID
+    std::map<DWORD, std::deque<float>> peakHistory;
     DWORD nextMicSessionId = MIC_SESSION_ID_BASE;
     int activeMixedCount = 0;
 
@@ -68,23 +84,63 @@ void MonitorThread() {
                 bool isTelegram = IsTelegramProcess(name);
                 float currentPeak = audioMonitor.GetProcessPeakLevel(pid);
                 bool hasRealAudio = (currentPeak > AUDIO_PEAK_THRESHOLD);
+                bool sessionActive = audioMonitor.IsSessionActive(pid);
 
-                // Maintain rolling peak history for all processes (used for Telegram)
+                // For Telegram: check if call window exists
+                bool telegramCallActive = false;
+                if (isTelegram) {
+                    telegramCallActive = IsTelegramInCall(pid);
+                }
+
+                // Maintain rolling peak history
                 auto& history = peakHistory[pid];
                 history.push_back(currentPeak);
                 if ((int)history.size() > config.telegramPeakHistorySize)
                     history.pop_front();
 
-                if (hasRealAudio && !callState[pid].isRecording) {
-                    startCounter[pid]++;
-                    Log(L"Audio detected: " + name + L" PID=" + std::to_wstring(pid) +
-                        L" peak=" + std::to_wstring(currentPeak) +
-                        L" count=" + std::to_wstring(startCounter[pid]) + L"/" + std::to_wstring(config.startThreshold), LogLevel::LOG_DEBUG);
+                // ===== START RECORDING =====
+                if (!callState[pid].isRecording) {
+                    bool shouldStart = false;
 
-                    if (startCounter[pid] < config.startThreshold) continue;
+                    if (isTelegram) {
+                        // Telegram: require BOTH audio peak AND call window present
+                        if (hasRealAudio && telegramCallActive) {
+                            startCounter[pid]++;
+                            Log(L"[TG] Call detected: PID=" + std::to_wstring(pid) +
+                                L" peak=" + std::to_wstring(currentPeak) +
+                                L" callWindow=YES" +
+                                L" count=" + std::to_wstring(startCounter[pid]) + L"/" + std::to_wstring(config.startThreshold), LogLevel::LOG_DEBUG);
+                            if (startCounter[pid] >= config.startThreshold)
+                                shouldStart = true;
+                        } else {
+                            if (startCounter[pid] > 0) startCounter[pid]--;
+                            if (hasRealAudio && !telegramCallActive) {
+                                Log(L"[TG] Audio but NO call window: PID=" + std::to_wstring(pid) +
+                                    L" peak=" + std::to_wstring(currentPeak) +
+                                    L" — ignoring (notification/voice msg)", LogLevel::LOG_DEBUG);
+                            }
+                        }
+                    } else {
+                        // Non-Telegram: use audio peak + session state for start
+                        if (hasRealAudio && sessionActive) {
+                            startCounter[pid]++;
+                            Log(L"Audio detected: " + name + L" PID=" + std::to_wstring(pid) +
+                                L" peak=" + std::to_wstring(currentPeak) +
+                                L" sessionActive=YES" +
+                                L" count=" + std::to_wstring(startCounter[pid]) + L"/" + std::to_wstring(config.startThreshold), LogLevel::LOG_DEBUG);
+                            if (startCounter[pid] >= config.startThreshold)
+                                shouldStart = true;
+                        } else {
+                            if (startCounter[pid] > 0) startCounter[pid]--;
+                        }
+                    }
 
+                    if (!shouldStart) continue;
+
+                    // === Begin recording ===
                     startCounter[pid] = 0;
                     silenceCounter[pid] = 0;
+                    inactiveCounter[pid] = 0;
                     std::wstring outputPath = BuildOutputPath(name, audioFormat);
                     DWORD micSessId = nextMicSessionId++;
                     if (nextMicSessionId >= 0xFFFFFFFF) nextMicSessionId = MIC_SESSION_ID_BASE;
@@ -118,57 +174,89 @@ void MonitorThread() {
                     UpdateTrayTooltip();
                     ShowTrayBalloon(L"Recording Started", name + L" — call recording in progress");
 
-                } else if (!hasRealAudio && !callState[pid].isRecording) {
-                    if (startCounter[pid] > 0) startCounter[pid]--;
-
                 } else if (callState[pid].isRecording) {
-                    // ===== SILENCE DETECTION DURING RECORDING =====
-                    // For Telegram: use rolling average peak because Telegram keeps audio session
-                    // active with micro-peaks even when no call is in progress.
-                    // For other apps: use simple hasRealAudio check (peak > 0.01).
+                    // ===== STOP RECORDING =====
+                    bool shouldStop = false;
+                    auto& cs = callState[pid];
 
-                    bool isSilent = false;
+                    // Calculate how long we've been recording
+                    auto elapsed = std::chrono::steady_clock::now() - cs.startTime;
+                    int elapsedSeconds = (int)std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+                    bool pastMinDuration = (elapsedSeconds >= config.minRecordingSeconds);
 
                     if (isTelegram) {
-                        // Calculate average peak over the rolling window
-                        float avgPeak = 0.0f;
-                        if (!history.empty()) {
-                            avgPeak = std::accumulate(history.begin(), history.end(), 0.0f) / (float)history.size();
+                        // Telegram: PRIMARY stop signal is call window disappearing
+                        if (!telegramCallActive) {
+                            inactiveCounter[pid]++;
+                            Log(L"[TG] Call window GONE: PID=" + std::to_wstring(pid) +
+                                L" counter=" + std::to_wstring(inactiveCounter[pid]) +
+                                L"/" + std::to_wstring(config.telegramSilenceCycles) +
+                                L" elapsed=" + std::to_wstring(elapsedSeconds) + L"s", LogLevel::LOG_DEBUG);
+                            if (inactiveCounter[pid] >= config.telegramSilenceCycles)
+                                shouldStop = true;
+                        } else {
+                            inactiveCounter[pid] = 0;
+                            Log(L"[TG] Call active: PID=" + std::to_wstring(pid) +
+                                L" peak=" + std::to_wstring(currentPeak) +
+                                L" elapsed=" + std::to_wstring(elapsedSeconds) + L"s", LogLevel::LOG_DEBUG);
                         }
-                        isSilent = (avgPeak < config.telegramSilencePeakThreshold);
-
-                        Log(L"[TG] PID=" + std::to_wstring(pid) +
-                            L" peak=" + std::to_wstring(currentPeak) +
-                            L" avgPeak=" + std::to_wstring(avgPeak) +
-                            L" silent=" + (isSilent ? L"YES" : L"NO") +
-                            L" counter=" + std::to_wstring(silenceCounter[pid]) +
-                            L"/" + std::to_wstring(config.telegramSilenceCycles), LogLevel::LOG_DEBUG);
                     } else {
-                        isSilent = !hasRealAudio;
+                        // Non-Telegram: PRIMARY stop signal is AudioSessionState becoming Inactive
+                        if (!sessionActive) {
+                            // Session is Inactive — call likely ended
+                            inactiveCounter[pid]++;
+                            silenceCounter[pid] = 0;
+                            Log(L"Session INACTIVE: " + name + L" PID=" + std::to_wstring(pid) +
+                                L" inactiveCount=" + std::to_wstring(inactiveCounter[pid]) +
+                                L" elapsed=" + std::to_wstring(elapsedSeconds) + L"s", LogLevel::LOG_DEBUG);
+
+                            // Wait a few cycles to confirm (session might briefly go inactive)
+                            if (inactiveCounter[pid] >= 3 && pastMinDuration)
+                                shouldStop = true;
+                        } else {
+                            // Session still Active — call ongoing
+                            inactiveCounter[pid] = 0;
+
+                            // Fallback: if session stays Active but no audio for a very long time
+                            // This handles edge cases like app bugs keeping session active
+                            if (!hasRealAudio) {
+                                silenceCounter[pid]++;
+                                if (silenceCounter[pid] >= config.silenceThreshold && pastMinDuration) {
+                                    Log(L"Fallback silence stop: " + name + L" PID=" + std::to_wstring(pid) +
+                                        L" silenceCount=" + std::to_wstring(silenceCounter[pid]) +
+                                        L" elapsed=" + std::to_wstring(elapsedSeconds) + L"s", LogLevel::LOG_DEBUG);
+                                    shouldStop = true;
+                                }
+                            } else {
+                                silenceCounter[pid] = 0;
+                            }
+                        }
                     }
 
-                    if (isSilent) {
-                        silenceCounter[pid]++;
-                        int threshold = isTelegram ? config.telegramSilenceCycles : config.silenceThreshold;
+                    // MinRecordingSeconds protection — don't stop too early
+                    if (shouldStop && !pastMinDuration) {
+                        Log(L"Stop blocked by MinRecordingSeconds: " + name +
+                            L" elapsed=" + std::to_wstring(elapsedSeconds) +
+                            L" min=" + std::to_wstring(config.minRecordingSeconds), LogLevel::LOG_DEBUG);
+                        shouldStop = false;
+                    }
 
-                        if (silenceCounter[pid] >= threshold) {
-                            auto& cs = callState[pid];
-                            if (cs.mixedEnabled) {
-                                activeMixedCount--;
-                                if (activeMixedCount <= 0) { captureManager.DisableMixedRecording(); activeMixedCount = 0; }
-                            }
-                            if (cs.micSessionId != 0) captureManager.StopCapture(cs.micSessionId);
-                            captureManager.StopCapture(pid);
-                            Log(L"REC STOP: " + cs.processName + L" PID=" + std::to_wstring(pid) + L" -> " + cs.outputPath);
-                            ShowTrayBalloon(L"Recording Stopped", cs.processName + L" — recording saved");
-                            cs = {};
-                            silenceCounter[pid] = 0;
-                            peakHistory.erase(pid);
-                            g_activeRecordings--;
-                            UpdateTrayTooltip();
+                    if (shouldStop) {
+                        if (cs.mixedEnabled) {
+                            activeMixedCount--;
+                            if (activeMixedCount <= 0) { captureManager.DisableMixedRecording(); activeMixedCount = 0; }
                         }
-                    } else {
+                        if (cs.micSessionId != 0) captureManager.StopCapture(cs.micSessionId);
+                        captureManager.StopCapture(pid);
+                        Log(L"REC STOP: " + cs.processName + L" PID=" + std::to_wstring(pid) +
+                            L" duration=" + std::to_wstring(elapsedSeconds) + L"s -> " + cs.outputPath);
+                        ShowTrayBalloon(L"Recording Stopped", cs.processName + L" — recording saved");
+                        cs = {};
                         silenceCounter[pid] = 0;
+                        inactiveCounter[pid] = 0;
+                        peakHistory.erase(pid);
+                        g_activeRecordings--;
+                        UpdateTrayTooltip();
                     }
                 }
             }
@@ -191,7 +279,10 @@ void MonitorThread() {
                     toRemove.push_back(pid);
                 }
             }
-            for (DWORD p : toRemove) { callState.erase(p); silenceCounter.erase(p); startCounter.erase(p); peakHistory.erase(p); }
+            for (DWORD p : toRemove) {
+                callState.erase(p); silenceCounter.erase(p); startCounter.erase(p);
+                peakHistory.erase(p); inactiveCounter.erase(p);
+            }
             UpdateTrayTooltip();
 
             // Push active recordings to shared StatusData for UI
@@ -242,6 +333,7 @@ void MonitorThread() {
 
                 bool mixedOk = captureManager.EnableMixedRecording(outputPath, audioFormat, cfgStart.mp3Bitrate);
                 if (!mixedOk) {
+                    Log(L"Mixed recording failed, falling back to process-only", LogLevel::LOG_WARN);
                     captureManager.StopCapture(pid);
                     if (micStarted) captureManager.StopCapture(micSessId);
                     bool directStarted = captureManager.StartCapture(pid, tp.name, outputPath, audioFormat, cfgStart.mp3Bitrate, false, L"", false);
@@ -256,7 +348,7 @@ void MonitorThread() {
                 Log(L"REC START (forced): " + tp.name + L" PID=" + std::to_wstring(pid) + L" -> " + outputPath);
                 UpdateTrayTooltip();
                 ShowTrayBalloon(L"Recording Started", tp.name + L" — forced recording");
-                break; // start recording for first found target
+                break;
             }
         }
 
@@ -277,6 +369,7 @@ void MonitorThread() {
             }
             callState.clear();
             silenceCounter.clear();
+            inactiveCounter.clear();
             startCounter.clear();
             peakHistory.clear();
             g_statusData.SetRecordings({});
