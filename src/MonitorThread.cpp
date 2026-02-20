@@ -28,6 +28,7 @@
 //
 // STOP recording (key change — no more peak-based silence!):
 //   - Telegram: IsTelegramInCall() returns false (call window closed)
+//              OR AudioSessionState becomes Inactive (call ended but chat window stays open)
 //   - Other apps: AudioSessionState becomes Inactive (Windows reports session ended)
 //   - Safety net: MinRecordingSeconds — first N seconds never stop
 //   - Fallback: SilenceThreshold still used if session stays Active but no audio
@@ -185,10 +186,25 @@ void MonitorThread() {
                     bool pastMinDuration = (elapsedSeconds >= config.minRecordingSeconds);
 
                     if (isTelegram) {
-                        // Telegram: PRIMARY stop signal is call window disappearing
+                        // Telegram STOP: two signals (either one triggers stop)
+                        // 1. Call window disappeared (telegramCallActive=false)
+                        // 2. Audio session became Inactive (call ended but chat window stays open)
+                        bool tgSessionInactive = !sessionActive;
+
                         if (!telegramCallActive) {
+                            // Signal 1: call window gone
                             inactiveCounter[pid]++;
                             Log(L"[TG] Call window GONE: PID=" + std::to_wstring(pid) +
+                                L" counter=" + std::to_wstring(inactiveCounter[pid]) +
+                                L"/" + std::to_wstring(config.telegramSilenceCycles) +
+                                L" elapsed=" + std::to_wstring(elapsedSeconds) + L"s", LogLevel::LOG_DEBUG);
+                            if (inactiveCounter[pid] >= config.telegramSilenceCycles)
+                                shouldStop = true;
+                        } else if (tgSessionInactive) {
+                            // Signal 2: window still open (chat window) but audio session is dead
+                            // This happens when call ends but chat remains open
+                            inactiveCounter[pid]++;
+                            Log(L"[TG] Window open but session INACTIVE: PID=" + std::to_wstring(pid) +
                                 L" counter=" + std::to_wstring(inactiveCounter[pid]) +
                                 L"/" + std::to_wstring(config.telegramSilenceCycles) +
                                 L" elapsed=" + std::to_wstring(elapsedSeconds) + L"s", LogLevel::LOG_DEBUG);
@@ -198,6 +214,7 @@ void MonitorThread() {
                             inactiveCounter[pid] = 0;
                             Log(L"[TG] Call active: PID=" + std::to_wstring(pid) +
                                 L" peak=" + std::to_wstring(currentPeak) +
+                                L" sessionActive=YES" +
                                 L" elapsed=" + std::to_wstring(elapsedSeconds) + L"s", LogLevel::LOG_DEBUG);
                         }
                     } else {
