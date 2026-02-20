@@ -59,12 +59,25 @@ static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     WM_OPEN_SETTINGS_MSG = RegisterWindowMessageW(L"RDPCallRecorder_OpenSettings");
 
-    HANDLE hMutexSingle = CreateMutexW(nullptr, FALSE, MUTEX_SINGLE_INSTANCE);
-    if (hMutexSingle && GetLastError() == ERROR_ALREADY_EXISTS) {
-        PostMessageW(HWND_BROADCAST, WM_OPEN_SETTINGS_MSG, 0, 0);
-        CloseHandle(hMutexSingle);
-        return 0;
+    // Try to acquire single-instance mutex with retry
+    // After Exit, the previous process may still be shutting down
+    HANDLE hMutexSingle = nullptr;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        hMutexSingle = CreateMutexW(nullptr, FALSE, MUTEX_SINGLE_INSTANCE);
+        if (hMutexSingle && GetLastError() == ERROR_ALREADY_EXISTS) {
+            CloseHandle(hMutexSingle);
+            hMutexSingle = nullptr;
+            if (attempt < 4) {
+                Sleep(1000); // Wait 1 second and retry
+                continue;
+            }
+            // After 5 attempts (5 seconds), assume it's a stale mutex — send open message
+            PostMessageW(HWND_BROADCAST, WM_OPEN_SETTINGS_MSG, 0, 0);
+            return 0;
+        }
+        break; // Mutex acquired successfully
     }
+    if (!hMutexSingle) return 0;
 
     LoadConfig(g_config);
     g_logLevel = ParseLogLevel(g_config.logLevel);
@@ -100,7 +113,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     Log(L"User: " + GetCurrentFullName() + L" (login: " + GetCurrentLoginName() + L")");
     Log(L"Recording path: " + GetConfigSnapshot().recordingPath);
 
-    if (firstLaunch) ShowSettingsDialog(g_hWndMain);
+    // Show balloon notification so user knows the app is running
+    ShowTrayBalloon(L"RDP Call Recorder", L"v" + std::wstring(APP_VERSION) + L" — Running");
+
+    if (firstLaunch) {
+        ShowSettingsDialog(g_hWndMain);
+    } else {
+        // Show main panel briefly so user sees the app started
+        ShowMainPanel(g_hWndMain);
+    }
 
     g_monitorThread = std::thread(MonitorThread);
     if (g_config.autoUpdate) g_updateThread = std::thread(AutoUpdateThread);
@@ -112,11 +133,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     }
 
     g_running = false;
+    // Release single-instance mutex FIRST so a new instance can start
+    // while we're still cleaning up threads
+    if (hMutexSingle) { ReleaseMutex(hMutexSingle); CloseHandle(hMutexSingle); hMutexSingle = nullptr; }
     if (g_monitorThread.joinable()) g_monitorThread.join();
     if (g_updateThread.joinable()) g_updateThread.join();
     RemoveTrayIcon();
     CloseLogFile();
-    if (hMutexSingle) CloseHandle(hMutexSingle);
     if (g_hMutex) CloseHandle(g_hMutex);
     CoUninitialize();
     return 0;
