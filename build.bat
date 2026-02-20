@@ -11,7 +11,7 @@ setlocal enabledelayedexpansion
 set "PROJECT_DIR=%~dp0"
 set "BUILD_DIR=%PROJECT_DIR%build"
 set "INSTALLER_DIR=%PROJECT_DIR%installer"
-set "AUDIOCAPTURE_DIR=%PROJECT_DIR%..\AudioCapture"
+set "AUDIOCAPTURE_DIR=C:\Users\User\Documents\Projects\AudioCapture"
 set "NSIS_PATH=C:\Program Files (x86)\NSIS\makensis.exe"
 
 :: --- Colors ---
