@@ -143,10 +143,12 @@ void MonitorThread() {
                     bool shouldStart = false;
 
                     if (isTelegram) {
-                        // Telegram: require call window + audio evidence
-                        // Use sessionActive OR hasRealAudio as audio proof
-                        // (Telegram peak is often 0 even during active calls)
-                        bool telegramAudioProof = (sessionActive || hasRealAudio);
+                        // Telegram: require call window + REAL audio from Telegram's process
+                        // Previously used (sessionActive || hasRealAudio), but sessionActive alone
+                        // caused false positives: Telegram can hold an Active audio session from
+                        // notifications while another app (MicroSIP, etc.) produces the actual sound.
+                        // Now we require actual audio peak from Telegram's process to avoid this.
+                        bool telegramAudioProof = hasRealAudio;
 
                         if (telegramAudioProof && telegramCallActive) {
                             startCounter[pid]++;

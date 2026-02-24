@@ -13,9 +13,22 @@ namespace fs = std::filesystem;
 
 LogLevel g_logLevel = LogLevel::LOG_INFO;
 
-static std::wofstream g_logFile;
+// Bug 16: Changed from std::wofstream to std::ofstream with UTF-8 encoding.
+// std::wofstream with default "C" locale cannot convert non-ASCII characters
+// (Cyrillic usernames, paths, etc.), causing the stream to enter fail state
+// and silently drop ALL subsequent log output.
+static std::ofstream g_logFile;
 static std::wstring g_logFilePath;
 static std::mutex g_logMutex;
+
+static std::string WideToUtf8(const std::wstring& wstr) {
+    if (wstr.empty()) return "";
+    int needed = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(), nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) return "(conversion error)";
+    std::string result(needed, 0);
+    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(), &result[0], needed, nullptr, nullptr);
+    return result;
+}
 
 // Bug 9: cached config values to avoid GetConfigSnapshot() on every Log() call
 static std::atomic<bool> g_loggingEnabled(true);
@@ -52,8 +65,15 @@ static void EnsureLogFileOpen(const fs::path& logDir) {
 
     if (!g_logFile.is_open()) {
         try { fs::create_directories(logDir); } catch (...) {}
-        g_logFile.open(logPath, std::ios::app);
+        // Bug 16: use narrow ofstream with UTF-8 conversion
+        std::string utf8Path = WideToUtf8(logPath);
+        bool isNewFile = !fs::exists(logFile);
+        g_logFile.open(utf8Path, std::ios::app | std::ios::binary);
         g_logFilePath = logPath;
+        // Write UTF-8 BOM for new files so text editors detect encoding
+        if (isNewFile && g_logFile.is_open()) {
+            g_logFile.write("\xEF\xBB\xBF", 3);
+        }
     }
 }
 
@@ -111,9 +131,9 @@ void Log(const std::wstring& message, LogLevel level) {
     try {
         EnsureLogFileOpen(logDir);
         if (g_logFile.is_open()) {
-            // Write \n to file (not \r\n — file uses Unix line endings)
-            std::wstring fileLine = std::wstring(timeStr) + L" [" + levelStr + L"] " + message + L"\n";
-            g_logFile << fileLine;
+            // Bug 16: convert to UTF-8 and write to narrow ofstream
+            std::string utf8Line = WideToUtf8(logLine);
+            g_logFile.write(utf8Line.c_str(), utf8Line.size());
             // Bug 14: flush every 10 lines or immediately on WARN/ERROR
             if (level >= LogLevel::LOG_WARN || ++g_flushCounter >= 10) {
                 g_logFile.flush();
