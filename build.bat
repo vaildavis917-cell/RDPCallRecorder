@@ -109,6 +109,13 @@ echo [5/5] Building installer...
 if not exist "%INSTALLER_DIR%\files" md "%INSTALLER_DIR%\files"
 xcopy "%BUILD_DIR%\bin\RDPCallRecorder.exe" "%INSTALLER_DIR%\files\" /Y >NUL
 echo [OK] Copied RDPCallRecorder.exe to installer\files\
+if exist "%PROJECT_DIR%config.ini" (
+    xcopy "%PROJECT_DIR%config.ini" "%INSTALLER_DIR%\files\" /Y >NUL
+    echo [OK] Copied config.ini to installer\files\
+) else (
+    echo [ERROR] config.ini not found in project root!
+    exit /b 1
+)
 
 :: --- Build NSIS installer ---
 if "!HAS_NSIS!"=="1" (
