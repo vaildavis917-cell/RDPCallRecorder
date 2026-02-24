@@ -439,11 +439,12 @@ void MonitorThread() {
             std::vector<FoundProcess> forceProcs = FindTargetProcesses(cfgStart);
 
             // Deduplicate parent/child (same as main loop) to avoid recording from wrong process
+            // Use legacy IsChildOfProcess (no snapshot) since procSnap is out of scope here
             {
                 std::set<DWORD> pidsToRemove;
                 for (auto& tp1 : forceProcs) {
                     for (auto& tp2 : forceProcs) {
-                        if (tp1.pid != tp2.pid && IsChildOfProcess(tp1.pid, tp2.pid, procSnap)) {
+                        if (tp1.pid != tp2.pid && IsChildOfProcess(tp1.pid, tp2.pid)) {
                             pidsToRemove.insert(tp2.pid);
                         }
                     }
