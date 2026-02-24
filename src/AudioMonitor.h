@@ -12,6 +12,8 @@
 
 using Microsoft::WRL::ComPtr;
 
+struct ProcessSnapshot;  // forward declaration from ProcessUtils.h
+
 AudioFormat GetAudioFormatFromConfig();
 std::wstring GetFileExtension(AudioFormat format);
 std::wstring BuildOutputPath(const std::wstring& processName, AudioFormat format);
@@ -29,9 +31,14 @@ public:
     AudioSessionMonitor() = default;
     ~AudioSessionMonitor() = default;
 
+    // Original methods (create snapshot per IsChildOfProcess call) - kept for backward compatibility
     bool CheckProcessRealAudio(DWORD processId, float threshold = 0.01f);
     float GetProcessPeakLevel(DWORD processId);
     bool IsSessionActive(DWORD processId);
+
+    // Snapshot-based methods (use cached ProcessSnapshot, no extra CreateToolhelp32Snapshot)
+    float GetProcessPeakLevel(DWORD processId, const ProcessSnapshot& snap);
+    bool IsSessionActive(DWORD processId, const ProcessSnapshot& snap);
 
     struct DetectedSession {
         DWORD pid;
@@ -44,6 +51,7 @@ public:
     std::vector<DetectedSession> FindActiveTargetSessions(
         const std::vector<std::wstring>& targetNames, float threshold = 0.01f);
     void DumpAudioSessions();
+    void DumpAudioSessions(const ProcessSnapshot& snap);
     void Reset();
 
 private:

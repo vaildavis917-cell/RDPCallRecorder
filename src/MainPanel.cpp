@@ -31,12 +31,12 @@ void StatusData::PushLogLine(const std::wstring& line) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_logRing.push_back(line);
     if (m_logRing.size() > MAX_LOG_LINES)
-        m_logRing.erase(m_logRing.begin());
+        m_logRing.pop_front();  // O(1) with deque
 }
 
 std::vector<std::wstring> StatusData::GetLogLines() {
     std::lock_guard<std::mutex> lock(m_mutex);
-    return m_logRing;
+    return std::vector<std::wstring>(m_logRing.begin(), m_logRing.end());
 }
 
 // ============================================================
@@ -194,6 +194,8 @@ static void SwitchTab(int tab) {
 // ============================================================
 // Refresh Status tab data
 // ============================================================
+static size_t g_lastLogLineCount = 0;
+
 static void RefreshStatusTab() {
     if (!g_hPanel || g_currentTab != TAB_STATUS) return;
 
@@ -256,18 +258,29 @@ static void RefreshStatusTab() {
         SendMessageW(g_hRecordingsList, LVM_SETITEMW, 0, (LPARAM)&lvi);
     }
 
-    // Update log view
+    // Update log view - append only new lines (Bug 12)
     auto logLines = g_statusData.GetLogLines();
-    std::wstring logText;
-    for (const auto& line : logLines) {
-        logText += line;
+    if (logLines.size() != g_lastLogLineCount) {
+        if (logLines.size() < g_lastLogLineCount) {
+            // Log was reset/truncated - full rewrite
+            std::wstring logText;
+            for (const auto& line : logLines) logText += line;
+            SetWindowTextW(g_hLogEdit, logText.c_str());
+        } else {
+            // Append only new lines
+            std::wstring newText;
+            for (size_t i = g_lastLogLineCount; i < logLines.size(); i++)
+                newText += logLines[i];
+            int textLen = GetWindowTextLengthW(g_hLogEdit);
+            SendMessageW(g_hLogEdit, EM_SETSEL, textLen, textLen);
+            SendMessageW(g_hLogEdit, EM_REPLACESEL, FALSE, (LPARAM)newText.c_str());
+        }
+        g_lastLogLineCount = logLines.size();
+        // Scroll to bottom
+        SendMessageW(g_hLogEdit, EM_SETSEL, -1, -1);
+        SendMessageW(g_hLogEdit, EM_SCROLLCARET, 0, 0);
+        SendMessageW(g_hLogEdit, EM_SETSEL, (WPARAM)-1, 0);
     }
-    SetWindowTextW(g_hLogEdit, logText.c_str());
-    // Scroll to bottom
-    SendMessageW(g_hLogEdit, EM_SETSEL, logText.size(), logText.size());
-    SendMessageW(g_hLogEdit, EM_SCROLLCARET, 0, 0);
-    // Deselect
-    SendMessageW(g_hLogEdit, EM_SETSEL, (WPARAM)-1, 0);
 }
 
 // ============================================================
@@ -387,6 +400,7 @@ static void CreateStatusTabControls(HWND hWnd) {
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_LOG_EDIT)),
         GetModuleHandle(nullptr), nullptr);
     SendMessageW(g_hLogEdit, WM_SETFONT, (WPARAM)g_hPanelFont, TRUE);
+    SendMessageW(g_hLogEdit, EM_SETLIMITTEXT, 100000, 0);  // 100KB max
     g_statusControls.push_back(g_hLogEdit);
 
     // Start / Stop Recording buttons

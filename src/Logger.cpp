@@ -6,6 +6,7 @@
 #include <fstream>
 #include <chrono>
 #include <mutex>
+#include <atomic>
 #include <filesystem>
 
 namespace fs = std::filesystem;
@@ -15,6 +16,19 @@ LogLevel g_logLevel = LogLevel::LOG_INFO;
 static std::wofstream g_logFile;
 static std::wstring g_logFilePath;
 static std::mutex g_logMutex;
+
+// Bug 9: Cache logging config to avoid GetConfigSnapshot() on every Log() call
+static std::atomic<bool> g_loggingEnabled(true);
+static std::atomic<int> g_maxLogSizeMB(10);
+
+// Bug 14: Periodic flush counter
+static int g_flushCounter = 0;
+
+void UpdateLoggerConfig() {
+    AgentConfig config = GetConfigSnapshot();
+    g_loggingEnabled.store(config.enableLogging, std::memory_order_relaxed);
+    g_maxLogSizeMB.store(config.maxLogSizeMB, std::memory_order_relaxed);
+}
 
 // Log directory is next to the exe: {ExeDir}/logs/
 static fs::path GetLogDir() {
@@ -28,9 +42,9 @@ static void EnsureLogFileOpen(const fs::path& logDir) {
     if (g_logFile.is_open() && g_logFilePath == logPath) {
         try {
             if (fs::exists(logFile)) {
-                auto config = GetConfigSnapshot();
+                int maxMB = g_maxLogSizeMB.load(std::memory_order_relaxed);
                 auto fileSize = fs::file_size(logFile);
-                auto maxSize = static_cast<uintmax_t>(config.maxLogSizeMB) * 1024 * 1024;
+                auto maxSize = static_cast<uintmax_t>(maxMB) * 1024 * 1024;
                 if (fileSize > maxSize) {
                     g_logFile.close();
                     fs::path backupLog = logDir / L"agent.log.old";
@@ -60,13 +74,13 @@ void InitLogger() {
         std::lock_guard<std::mutex> lock(g_logMutex);
         EnsureLogFileOpen(logDir);
     } catch (...) {
-        // Silently fail — Log() will retry later
+        // Silently fail - Log() will retry later
     }
 }
 
 void Log(const std::wstring& message, LogLevel level) {
-    AgentConfig config = GetConfigSnapshot();
-    if (!config.enableLogging) return;
+    // Bug 9: Use cached atomic instead of GetConfigSnapshot()
+    if (!g_loggingEnabled.load(std::memory_order_relaxed)) return;
     if (level < g_logLevel) return;
 
     auto now = std::chrono::system_clock::now();
@@ -97,10 +111,14 @@ void Log(const std::wstring& message, LogLevel level) {
     try {
         EnsureLogFileOpen(logDir);
         if (g_logFile.is_open()) {
-            // Write \n to file (not \r\n — file uses Unix line endings)
+            // Write \n to file (not \r\n - file uses Unix line endings)
             std::wstring fileLine = std::wstring(timeStr) + L" [" + levelStr + L"] " + message + L"\n";
             g_logFile << fileLine;
-            if (level >= LogLevel::LOG_WARN) g_logFile.flush();
+            // Bug 14: Flush on WARN/ERROR or every 10 lines
+            if (level >= LogLevel::LOG_WARN || ++g_flushCounter >= 10) {
+                g_logFile.flush();
+                g_flushCounter = 0;
+            }
         }
     } catch (const std::exception&) {}
 }
