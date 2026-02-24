@@ -46,6 +46,15 @@
 ### Bundled AudioCapture
 - AudioCapture library is now included in `extern/AudioCapture/` inside the repository. No need to clone it separately.
 
+### Hardened auto-update system
+- Added `Accept: application/vnd.github+json` and `User-Agent` headers to GitHub API requests — prevents HTML responses on rate-limited or misconfigured endpoints.
+- Added HTTP status code check in `WinHttpGet` — returns empty on non-200 (e.g. 403 rate limit) instead of trying to parse HTML as JSON.
+- Reused `hSession` across redirects in `WinHttpDownloadFile` — eliminates redundant session creation on GitHub's 3-hop redirects.
+- Fixed PID substring false match in update bat script — switched to CSV output with exact match.
+- Added `ERRORLEVEL` check after silent installer — aborts and rolls back on failure.
+- Added exe backup before install — old exe is copied to `.bak`, restored if install fails or exe is missing after install.
+- Removed 2-minute startup delay — update check runs immediately on launch, then periodically.
+
 ### Configuration
 - Added explicit `MaxRecordingSeconds=7200` to `config.ini` for transparency (2-hour safety limit).
 

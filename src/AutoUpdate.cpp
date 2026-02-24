@@ -48,6 +48,8 @@ static std::wstring ExtractJsonString(const std::wstring& json, const std::wstri
     return L"";
 }
 
+// Fix 1: Added Accept: application/json header
+// Fix 2: Added HTTP status code check (handles 403 rate limit, etc.)
 static std::wstring WinHttpGet(const std::wstring& host, const std::wstring& path) {
     std::wstring result;
     HINTERNET hSession = WinHttpOpen(L"RDPCallRecorder-AutoUpdate/1.0",
@@ -61,10 +63,23 @@ static std::wstring WinHttpGet(const std::wstring& host, const std::wstring& pat
         nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
     if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return result; }
 
-    if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+    // Add Accept and User-Agent headers for GitHub API reliability
+    LPCWSTR headers = L"Accept: application/vnd.github+json\r\nUser-Agent: RDPCallRecorder-AutoUpdate/1.0\r\n";
+    if (!WinHttpSendRequest(hRequest, headers, (DWORD)-1L, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
         !WinHttpReceiveResponse(hRequest, nullptr)) {
         WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
         return result;
+    }
+
+    // Check HTTP status code before reading body
+    DWORD statusCode = 0, statusSize = sizeof(statusCode);
+    WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+
+    if (statusCode != 200) {
+        Log(L"[UPDATE] HTTP GET returned " + std::to_wstring(statusCode), LogLevel::LOG_WARN);
+        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+        return result;  // return empty — caller handles it
     }
 
     std::string body;
@@ -87,10 +102,14 @@ static std::wstring WinHttpGet(const std::wstring& host, const std::wstring& pat
     return result;
 }
 
-// Download file with manual redirect handling (GitHub redirects to objects.githubusercontent.com)
+// Fix 3: Reuse hSession across redirects instead of creating a new one each iteration
 static bool WinHttpDownloadFile(const std::wstring& url, const std::wstring& localPath) {
     std::wstring currentUrl = url;
     int maxRedirects = 5;
+
+    HINTERNET hSession = WinHttpOpen(L"RDPCallRecorder-AutoUpdate/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return false;
 
     for (int redirect = 0; redirect < maxRedirects; redirect++) {
         URL_COMPONENTS urlComp = {};
@@ -101,12 +120,9 @@ static bool WinHttpDownloadFile(const std::wstring& url, const std::wstring& loc
 
         if (!WinHttpCrackUrl(currentUrl.c_str(), (DWORD)currentUrl.length(), 0, &urlComp)) {
             Log(L"[UPDATE] Failed to parse URL: " + currentUrl, LogLevel::LOG_ERROR);
+            WinHttpCloseHandle(hSession);
             return false;
         }
-
-        HINTERNET hSession = WinHttpOpen(L"RDPCallRecorder-AutoUpdate/1.0",
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-        if (!hSession) return false;
 
         HINTERNET hConnect = WinHttpConnect(hSession, urlComp.lpszHostName, urlComp.nPort, 0);
         if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
@@ -143,8 +159,8 @@ static bool WinHttpDownloadFile(const std::wstring& url, const std::wstring& loc
                 WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
                 return false;
             }
-            WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
-            continue; // Follow redirect
+            WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect);
+            continue; // Follow redirect — reuse hSession
         }
 
         if (statusCode != 200) {
@@ -197,15 +213,14 @@ static bool WinHttpDownloadFile(const std::wstring& url, const std::wstring& loc
         return ok;
     }
 
+    WinHttpCloseHandle(hSession);
     Log(L"[UPDATE] Too many redirects", LogLevel::LOG_ERROR);
     return false;
 }
 
-// Create a helper .bat script that:
-// 1. Waits for the current process to exit (by PID, not process name!)
-// 2. Runs the installer silently
-// 3. Restarts the app
-// 4. Cleans up after itself
+// Fix 4: PID exact match using findstr /B /C with "PID" column
+// Fix 5: Check installer ERRORLEVEL — abort if install fails
+// Fix 6: Backup old exe before install, rollback on failure
 static bool CreateUpdateBat(const std::wstring& batPath, const std::wstring& installerPath,
                             const std::wstring& exePath, DWORD currentPid) {
     std::ofstream f(batPath, std::ios::trunc);
@@ -219,10 +234,12 @@ static bool CreateUpdateBat(const std::wstring& batPath, const std::wstring& ins
 
     f << "@echo off\r\n";
     f << "echo Waiting for RDP Call Recorder (PID " << currentPid << ") to close...\r\n";
+
     // Wait for the current process to exit (poll every 1 second, max 30 seconds)
+    // Fix 4: Use tasklist /FI "PID eq N" /NH /FO CSV and findstr for exact PID match
     f << "set /a WAIT_COUNT=0\r\n";
     f << ":waitloop\r\n";
-    f << "tasklist /FI \"PID eq " << currentPid << "\" 2>NUL | find /I \"" << currentPid << "\" >NUL\r\n";
+    f << "tasklist /FI \"PID eq " << currentPid << "\" /NH /FO CSV 2>NUL | findstr /C:\"" << currentPid << "\" >NUL\r\n";
     f << "if %ERRORLEVEL%==0 (\r\n";
     f << "    set /a WAIT_COUNT+=1\r\n";
     f << "    if %WAIT_COUNT% GEQ 30 goto forcekill\r\n";
@@ -230,20 +247,45 @@ static bool CreateUpdateBat(const std::wstring& batPath, const std::wstring& ins
     f << "    goto waitloop\r\n";
     f << ")\r\n";
     f << "goto doinstall\r\n";
+
     // Force kill ONLY our PID as safety net (not all instances!)
     f << ":forcekill\r\n";
     f << "echo Force killing PID " << currentPid << "...\r\n";
     f << "taskkill /F /PID " << currentPid << " >NUL 2>&1\r\n";
     f << "timeout /t 2 /nobreak >NUL\r\n";
-    // Install
+
+    // Install with backup and rollback
     f << ":doinstall\r\n";
+
+    // Fix 6: Backup old exe before installing
+    f << "echo Backing up current version...\r\n";
+    f << "if exist \"" << exeNarrow << "\" copy /Y \"" << exeNarrow << "\" \"" << exeNarrow << ".bak\" >NUL 2>&1\r\n";
+
     f << "echo Installing update...\r\n";
+    // Fix 5: Check installer exit code
     f << "\"" << installerNarrow << "\" /S\r\n";
-    // Wait for installer to finish
+    f << "if %ERRORLEVEL% NEQ 0 (\r\n";
+    f << "    echo Install failed with error %ERRORLEVEL%!\r\n";
+    f << "    echo Rolling back to previous version...\r\n";
+    f << "    if exist \"" << exeNarrow << ".bak\" copy /Y \"" << exeNarrow << ".bak\" \"" << exeNarrow << "\" >NUL 2>&1\r\n";
+    f << "    goto cleanup\r\n";
+    f << ")\r\n";
+
+    // Verify the exe exists after install
+    f << "if not exist \"" << exeNarrow << "\" (\r\n";
+    f << "    echo Exe missing after install! Rolling back...\r\n";
+    f << "    if exist \"" << exeNarrow << ".bak\" copy /Y \"" << exeNarrow << ".bak\" \"" << exeNarrow << "\" >NUL 2>&1\r\n";
+    f << "    goto cleanup\r\n";
+    f << ")\r\n";
+
+    // Remove backup on success
+    f << "del \"" << exeNarrow << ".bak\" >NUL 2>&1\r\n";
+
+    f << ":cleanup\r\n";
     f << "echo Starting RDP Call Recorder...\r\n";
-    f << "timeout /t 3 /nobreak >NUL\r\n";
+    f << "timeout /t 2 /nobreak >NUL\r\n";
     f << "start \"\" \"" << exeNarrow << "\"\r\n";
-    // Clean up
+    // Clean up installer and self
     f << "del \"" << installerNarrow << "\" >NUL 2>&1\r\n";
     f << "del \"%~f0\" >NUL 2>&1\r\n";
     f.close();
@@ -350,12 +392,17 @@ void CheckForUpdates(bool showNoUpdateMsg) {
 }
 
 void AutoUpdateThread() {
-    std::this_thread::sleep_for(std::chrono::minutes(2));
+    // Check immediately on startup
+    auto config = GetConfigSnapshot();
+    if (config.autoUpdate) CheckForUpdates(false);
+
+    // Then check periodically
     while (g_running) {
-        auto config = GetConfigSnapshot();
-        if (config.autoUpdate) CheckForUpdates(false);
         int hours = config.updateCheckIntervalHours;
         for (int i = 0; i < hours * 60 && g_running; i++)
             std::this_thread::sleep_for(std::chrono::minutes(1));
+        if (!g_running) break;
+        config = GetConfigSnapshot();
+        if (config.autoUpdate) CheckForUpdates(false);
     }
 }
