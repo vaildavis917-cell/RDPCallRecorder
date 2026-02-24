@@ -26,7 +26,7 @@ namespace fs = std::filesystem;
 // Call detection strategy (hybrid approach):
 //
 // START recording:
-//   - Telegram: sessionActive/hasRealAudio + IsTelegramInCall() (window title check)
+//   - Telegram: hasRealAudio (audio peak > threshold) + IsTelegramInCall() (window title check)
 //   - Other apps: audio peak detected (startThreshold cycles)
 //
 // STOP recording:
