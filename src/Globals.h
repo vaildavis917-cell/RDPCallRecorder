@@ -18,7 +18,7 @@
 
 inline constexpr wchar_t WINDOW_CLASS_NAME[] = L"RDPCallRecorderWndClass";
 inline constexpr wchar_t APP_TITLE[] = L"RDP Call Recorder";
-inline constexpr wchar_t APP_VERSION[] = L"2.6.7";
+inline constexpr wchar_t APP_VERSION[] = L"2.7.1";
 inline constexpr wchar_t GITHUB_REPO_OWNER[] = L"vaildavis917-cell";
 inline constexpr wchar_t GITHUB_REPO_NAME[] = L"RDPCallRecorder";
 inline constexpr int UPDATE_CHECK_INTERVAL_HOURS = 6;

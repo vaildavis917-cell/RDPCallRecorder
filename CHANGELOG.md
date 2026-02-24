@@ -1,6 +1,6 @@
 # Changelog
 
-## v2.6.7 (2026-02-24)
+## v2.7.1 (2026-02-24)
 
 ### Fixed audio detection on non-default devices
 - Fixed `GetProcessPeakLevel()` scanning only the default render device — now enumerates all active render devices. This fixes missed recordings in RDP sessions where the app audio plays on a non-default endpoint.
