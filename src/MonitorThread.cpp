@@ -18,9 +18,6 @@
 #include <chrono>
 #include <algorithm>
 #include <numeric>
-#include <filesystem>
-
-namespace fs = std::filesystem;
 
 // ============================================================
 // Call detection strategy (hybrid approach):
@@ -33,8 +30,8 @@ namespace fs = std::filesystem;
 //   - Telegram: IsTelegramInCall() returns false (call window closed)
 //              OR AudioSessionState becomes Inactive (call ended but chat window stays open)
 //   - Other apps: AudioSessionState becomes Inactive (Windows reports session ended)
-//   - Safety net: MinRecordingSeconds - first N seconds never stop
-//   - Safety net: MaxRecordingSeconds - force stop after N seconds (default 2 hours)
+//   - Safety net: MinRecordingSeconds — first N seconds never stop
+//   - Safety net: MaxRecordingSeconds — force stop after N seconds (default 2 hours)
 //   - Fallback: SilenceThreshold with AVERAGE peak (not instant)
 //     Single notification sounds don't reset silence counter
 //     Only sustained audio (real conversation) resets it
@@ -74,48 +71,14 @@ void MonitorThread() {
         try {
             audioFormat = GetAudioFormatFromConfig();
             AgentConfig config = GetConfigSnapshot();
-
-            // Bug 9: Update cached logger config each cycle
-            UpdateLoggerConfig();
-
-            // Bug 4: One process snapshot per cycle
-            ProcessSnapshot procSnap;
-            procSnap.Refresh();
-
-            // Bug 3: Periodically reset audio device cache (every ~30 seconds)
-            static int deviceResetCounter = 0;
-            if (++deviceResetCounter >= 15) {
-                deviceResetCounter = 0;
-                audioMonitor.Reset();
-            }
-
             std::vector<FoundProcess> targetProcs = FindTargetProcesses(config);
-
-            // Bug 11: Deduplicate parent/child processes
-            // If both parent and child are in the list, keep only child
-            // (child is the one actually playing audio)
-            {
-                std::set<DWORD> pidsToRemove;
-                for (auto& tp1 : targetProcs) {
-                    for (auto& tp2 : targetProcs) {
-                        if (tp1.pid != tp2.pid && IsChildOfProcess(tp1.pid, tp2.pid, procSnap)) {
-                            pidsToRemove.insert(tp2.pid);  // remove parent
-                        }
-                    }
-                }
-                targetProcs.erase(
-                    std::remove_if(targetProcs.begin(), targetProcs.end(),
-                        [&](const FoundProcess& fp) { return pidsToRemove.count(fp.pid) > 0; }),
-                    targetProcs.end());
-            }
-
             std::set<DWORD> currentPids;
 
             for (auto& tp : targetProcs)
                 Log(L"[DIAG] Found target: " + tp.name + L" PID=" + std::to_wstring(tp.pid), LogLevel::LOG_DEBUG);
 
             static int diagCounter = 0;
-            if (++diagCounter >= 15) { diagCounter = 0; audioMonitor.DumpAudioSessions(procSnap); }
+            if (++diagCounter >= 15) { diagCounter = 0; audioMonitor.DumpAudioSessions(); }
 
             for (auto& tp : targetProcs) {
                 DWORD pid = tp.pid;
@@ -123,9 +86,9 @@ void MonitorThread() {
                 currentPids.insert(pid);
 
                 bool isTelegram = IsTelegramProcess(name);
-                float currentPeak = audioMonitor.GetProcessPeakLevel(pid, procSnap);
+                float currentPeak = audioMonitor.GetProcessPeakLevel(pid);
                 bool hasRealAudio = (currentPeak > AUDIO_PEAK_THRESHOLD);
-                bool sessionActive = audioMonitor.IsSessionActive(pid, procSnap);
+                bool sessionActive = audioMonitor.IsSessionActive(pid);
 
                 // For Telegram: check if call window exists
                 bool telegramCallActive = false;
@@ -188,12 +151,7 @@ void MonitorThread() {
                         }
                     }
 
-                    if (!shouldStart) {
-                        // Bug 7: Don't let peakHistory grow indefinitely for non-recording processes
-                        if (peakHistory[pid].size() > (size_t)config.telegramPeakHistorySize * 2)
-                            peakHistory[pid].clear();
-                        continue;
-                    }
+                    if (!shouldStart) continue;
 
                     // === Begin recording ===
                     startCounter[pid] = 0;
@@ -230,7 +188,7 @@ void MonitorThread() {
                     if (mixedOk) activeMixedCount++;
                     Log(L"REC START: " + name + L" PID=" + std::to_wstring(pid) + L" -> " + outputPath);
                     UpdateTrayTooltip();
-                    ShowTrayBalloon(L"Recording Started", name + L" - call recording in progress");
+                    ShowTrayBalloon(L"Recording Started", name + L" — call recording in progress");
 
                 } else if (callState[pid].isRecording) {
                     // ===== STOP RECORDING =====
@@ -296,7 +254,7 @@ void MonitorThread() {
                     } else if (!shouldStop) {
                         // Non-Telegram: PRIMARY stop signal is AudioSessionState becoming Inactive
                         if (!sessionActive) {
-                            // Session is Inactive - call likely ended
+                            // Session is Inactive — call likely ended
                             inactiveCounter[pid]++;
                             silenceCounter[pid] = 0;
                             Log(L"Session INACTIVE: " + name + L" PID=" + std::to_wstring(pid) +
@@ -307,7 +265,7 @@ void MonitorThread() {
                             if (inactiveCounter[pid] >= 3 && pastMinDuration)
                                 shouldStop = true;
                         } else {
-                            // Session still Active - call ongoing
+                            // Session still Active — call ongoing
                             inactiveCounter[pid] = 0;
 
                             // Fallback: use AVERAGE peak instead of instant peak
@@ -334,7 +292,7 @@ void MonitorThread() {
                         }
                     }
 
-                    // MinRecordingSeconds protection - don't stop too early
+                    // MinRecordingSeconds protection — don't stop too early
                     if (shouldStop && !pastMinDuration && !pastMaxDuration) {
                         Log(L"Stop blocked by MinRecordingSeconds: " + name +
                             L" elapsed=" + std::to_wstring(elapsedSeconds) +
@@ -349,20 +307,9 @@ void MonitorThread() {
                         }
                         if (cs.micSessionId != 0) captureManager.StopCapture(cs.micSessionId);
                         captureManager.StopCapture(pid);
-
-                        // Bug 15: Delete tiny/empty recordings (likely false triggers)
-                        try {
-                            auto fileSize = fs::file_size(cs.outputPath);
-                            if (fileSize < 10000) {  // < 10KB - not a real recording
-                                fs::remove(cs.outputPath);
-                                Log(L"Deleted tiny recording (" + std::to_wstring(fileSize) +
-                                    L" bytes): " + cs.outputPath, LogLevel::LOG_WARN);
-                            }
-                        } catch (...) {}
-
                         Log(L"REC STOP: " + cs.processName + L" PID=" + std::to_wstring(pid) +
                             L" duration=" + std::to_wstring(elapsedSeconds) + L"s -> " + cs.outputPath);
-                        ShowTrayBalloon(L"Recording Stopped", cs.processName + L" - recording saved");
+                        ShowTrayBalloon(L"Recording Stopped", cs.processName + L" — recording saved");
                         cs = {};
                         silenceCounter[pid] = 0;
                         inactiveCounter[pid] = 0;
@@ -384,7 +331,7 @@ void MonitorThread() {
                         if (cs.micSessionId != 0) captureManager.StopCapture(cs.micSessionId);
                         captureManager.StopCapture(pid);
                         Log(L"REC STOP (exited): " + cs.processName + L" PID=" + std::to_wstring(pid), LogLevel::LOG_WARN);
-                        ShowTrayBalloon(L"Recording Stopped", cs.processName + L" - process exited, recording saved");
+                        ShowTrayBalloon(L"Recording Stopped", cs.processName + L" — process exited, recording saved");
                         cs.isRecording = false;
                         g_activeRecordings--;
                     }
@@ -459,7 +406,7 @@ void MonitorThread() {
                 if (mixedOk) activeMixedCount++;
                 Log(L"REC START (forced): " + tp.name + L" PID=" + std::to_wstring(pid) + L" -> " + outputPath);
                 UpdateTrayTooltip();
-                ShowTrayBalloon(L"Recording Started", tp.name + L" - forced recording");
+                ShowTrayBalloon(L"Recording Started", tp.name + L" — forced recording");
                 break;
             }
         }
@@ -488,6 +435,7 @@ void MonitorThread() {
             UpdateTrayTooltip();
         }
 
+        AgentConfig config = GetConfigSnapshot();
         for (int i = 0; i < config.pollIntervalSeconds * 10 && g_running; i++)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }

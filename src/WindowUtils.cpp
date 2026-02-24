@@ -5,7 +5,6 @@
 struct EnumWindowsData {
     DWORD targetPid;
     std::vector<std::wstring> titles;
-    std::vector<HWND> hwnds;
 };
 
 static BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
@@ -15,19 +14,20 @@ static BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
     GetWindowThreadProcessId(hwnd, &windowPid);
 
     if (windowPid != data->targetPid)
-        return TRUE;
+        return TRUE;  // continue enumeration
 
+    // Only consider visible windows
     if (!IsWindowVisible(hwnd))
         return TRUE;
 
+    // Get window title
     wchar_t titleBuf[512] = {};
     int len = GetWindowTextW(hwnd, titleBuf, 512);
     if (len > 0) {
         data->titles.push_back(std::wstring(titleBuf, len));
-        data->hwnds.push_back(hwnd);
     }
 
-    return TRUE;
+    return TRUE;  // continue enumeration
 }
 
 std::vector<std::wstring> GetWindowTitlesForPid(DWORD pid) {
@@ -45,56 +45,44 @@ bool IsTelegramInCall(DWORD pid) {
         return false;
     }
 
+    // Log all window titles for debugging
     for (const auto& t : titles) {
         Log(L"[TG-WIN] PID=" + std::to_wstring(pid) + L" window: \"" + t + L"\"", LogLevel::LOG_DEBUG);
     }
 
-    // Telegram Desktop call window characteristics:
-    // - Title is a contact name (does NOT start with "Telegram")
-    // - Title does NOT contain common non-call patterns
+    // Telegram main window title starts with "Telegram" (e.g. "Telegram", "Telegram (5)")
+    // During a call, Telegram creates a SEPARATE window with the contact's name as title.
+    // That call window title does NOT start with "Telegram".
     //
-    // Known FALSE POSITIVES to filter out:
-    // - Media viewer: title is filename or empty
-    // - Profile/info panels: merged into main window (same HWND, not separate)
-    // - Forward dialog: typically modal, not separate top-level
+    // Strategy: if there is any visible window whose title does NOT start with "Telegram"
+    // and is not empty, then a call is likely active.
+    //
+    // Edge cases to handle:
+    // - Media player popup: title could be song name (but these are usually not separate windows)
+    // - System tray tooltip: not a real window
+    // - "TelegramDesktop" class windows with empty titles
 
+    bool hasMainWindow = false;
     bool hasCallWindow = false;
 
     for (const auto& title : titles) {
         std::wstring lower = title;
         std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
 
-        // Skip main Telegram window
-        if (lower.find(L"telegram") == 0)
-            continue;
-
-        // Skip empty titles
-        if (title.empty())
-            continue;
-
-        // Skip likely media viewer windows (file extensions in title)
-        if (lower.find(L".jpg") != std::wstring::npos ||
-            lower.find(L".jpeg") != std::wstring::npos ||
-            lower.find(L".png") != std::wstring::npos ||
-            lower.find(L".gif") != std::wstring::npos ||
-            lower.find(L".mp4") != std::wstring::npos ||
-            lower.find(L".webm") != std::wstring::npos ||
-            lower.find(L".webp") != std::wstring::npos ||
-            lower.find(L".mov") != std::wstring::npos ||
-            lower.find(L".pdf") != std::wstring::npos ||
-            lower.find(L".mp3") != std::wstring::npos ||
-            lower.find(L".ogg") != std::wstring::npos) {
+        if (lower.find(L"telegram") == 0) {
+            // Main window: "Telegram", "Telegram (3)", etc.
+            hasMainWindow = true;
+        } else {
+            // Non-Telegram titled window — likely a call panel
+            // The call window title is the contact's name
+            hasCallWindow = true;
             Log(L"[TG-WIN] PID=" + std::to_wstring(pid) +
-                L" SKIPPING media window: \"" + title + L"\"", LogLevel::LOG_DEBUG);
-            continue;
+                L" CALL WINDOW detected: \"" + title + L"\"", LogLevel::LOG_DEBUG);
         }
-
-        // This looks like a call window - contact name as title
-        hasCallWindow = true;
-        Log(L"[TG-WIN] PID=" + std::to_wstring(pid) +
-            L" CALL WINDOW detected: \"" + title + L"\"", LogLevel::LOG_DEBUG);
     }
 
+    // A call is active if we have both the main window AND a separate call window
+    // (or at minimum, a call window exists)
     if (hasCallWindow) {
         Log(L"[TG-WIN] PID=" + std::to_wstring(pid) + L" -> CALL ACTIVE", LogLevel::LOG_DEBUG);
         return true;

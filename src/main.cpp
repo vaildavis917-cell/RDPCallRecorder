@@ -90,7 +90,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     SetProcessPriorityFromConfig(g_config.processPriority);
     if (g_config.autoRegisterStartup) RegisterAutoStart();
 
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
     // Init common controls (needed for Tab Control and ListView)
     INITCOMMONCONTROLSEX icex = {};

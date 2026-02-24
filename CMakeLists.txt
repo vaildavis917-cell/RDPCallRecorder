@@ -5,12 +5,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-set(AUDIOCAPTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../AudioCapture" CACHE PATH "Path to AudioCapture repository")
+set(AUDIOCAPTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/extern/AudioCapture" CACHE PATH "Path to AudioCapture (bundled)")
 
 if(NOT EXISTS "${AUDIOCAPTURE_DIR}/include/AudioCapture.h")
     message(FATAL_ERROR
         "AudioCapture not found at: ${AUDIOCAPTURE_DIR}\n"
-        "Clone it: git clone https://github.com/masonasons/AudioCapture.git\n"
+        "It should be bundled in extern/AudioCapture/.\n"
         "Or set: cmake -DAUDIOCAPTURE_DIR=C:/path/to/AudioCapture ..")
 endif()
 

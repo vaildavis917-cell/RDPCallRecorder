@@ -14,4 +14,3 @@ extern LogLevel g_logLevel;
 void InitLogger();
 void Log(const std::wstring& message, LogLevel level = LogLevel::LOG_INFO);
 void CloseLogFile();
-void UpdateLoggerConfig();
