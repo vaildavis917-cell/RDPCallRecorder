@@ -13,6 +13,7 @@ struct AgentConfig {
     int silenceThreshold = 15;
     int startThreshold = 2;
     int minRecordingSeconds = 60;
+    int maxRecordingSeconds = 7200;  // 2 hours safety net
     float telegramSilencePeakThreshold = 0.03f;
     int telegramPeakHistorySize = 5;
     int telegramSilenceCycles = 3;

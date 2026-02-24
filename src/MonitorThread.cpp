@@ -23,21 +23,24 @@
 // Call detection strategy (hybrid approach):
 //
 // START recording:
-//   - Telegram: audio peak detected + IsTelegramInCall() (window title check)
+//   - Telegram: sessionActive/hasRealAudio + IsTelegramInCall() (window title check)
 //   - Other apps: audio peak detected (startThreshold cycles)
 //
-// STOP recording (key change — no more peak-based silence!):
+// STOP recording:
 //   - Telegram: IsTelegramInCall() returns false (call window closed)
 //              OR AudioSessionState becomes Inactive (call ended but chat window stays open)
 //   - Other apps: AudioSessionState becomes Inactive (Windows reports session ended)
 //   - Safety net: MinRecordingSeconds — first N seconds never stop
-//   - Fallback: SilenceThreshold still used if session stays Active but no audio
-//     for a very long time (e.g. app bug keeps session active after call)
+//   - Safety net: MaxRecordingSeconds — force stop after N seconds (default 2 hours)
+//   - Fallback: SilenceThreshold with AVERAGE peak (not instant)
+//     Single notification sounds don't reset silence counter
+//     Only sustained audio (real conversation) resets it
 //
 // This eliminates recording fragmentation because:
 //   - AudioSessionState stays Active for the entire call duration
 //   - Pauses in conversation do NOT change session state
 //   - Session becomes Inactive only when the call truly ends
+//   - Average peak prevents notification sounds from extending recording
 // ============================================================
 
 static bool IsTelegramProcess(const std::wstring& name) {
@@ -196,8 +199,26 @@ void MonitorThread() {
                     auto elapsed = std::chrono::steady_clock::now() - cs.startTime;
                     int elapsedSeconds = (int)std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
                     bool pastMinDuration = (elapsedSeconds >= config.minRecordingSeconds);
+                    bool pastMaxDuration = (elapsedSeconds >= config.maxRecordingSeconds);
 
-                    if (isTelegram) {
+                    // Safety net: force stop if recording exceeds max duration
+                    if (pastMaxDuration) {
+                        Log(L"MAX DURATION reached: " + name + L" PID=" + std::to_wstring(pid) +
+                            L" elapsed=" + std::to_wstring(elapsedSeconds) +
+                            L"s max=" + std::to_wstring(config.maxRecordingSeconds) + L"s", LogLevel::LOG_WARN);
+                        shouldStop = true;
+                    }
+
+                    // Calculate average peak from rolling history for smarter silence detection
+                    // Single notification sounds won't reset silence counter
+                    float avgPeak = 0.0f;
+                    auto& hist = peakHistory[pid];
+                    if (!hist.empty()) {
+                        avgPeak = std::accumulate(hist.begin(), hist.end(), 0.0f) / (float)hist.size();
+                    }
+                    bool hasSustainedAudio = (avgPeak > AUDIO_PEAK_THRESHOLD);
+
+                    if (!shouldStop && isTelegram) {
                         // Telegram STOP: two signals (either one triggers stop)
                         // 1. Call window disappeared (telegramCallActive=false)
                         // 2. Audio session became Inactive (call ended but chat window stays open)
@@ -226,10 +247,11 @@ void MonitorThread() {
                             inactiveCounter[pid] = 0;
                             Log(L"[TG] Call active: PID=" + std::to_wstring(pid) +
                                 L" peak=" + std::to_wstring(currentPeak) +
+                                L" avgPeak=" + std::to_wstring(avgPeak) +
                                 L" sessionActive=YES" +
                                 L" elapsed=" + std::to_wstring(elapsedSeconds) + L"s", LogLevel::LOG_DEBUG);
                         }
-                    } else {
+                    } else if (!shouldStop) {
                         // Non-Telegram: PRIMARY stop signal is AudioSessionState becoming Inactive
                         if (!sessionActive) {
                             // Session is Inactive — call likely ended
@@ -246,13 +268,21 @@ void MonitorThread() {
                             // Session still Active — call ongoing
                             inactiveCounter[pid] = 0;
 
-                            // Fallback: if session stays Active but no audio for a very long time
-                            // This handles edge cases like app bugs keeping session active
-                            if (!hasRealAudio) {
+                            // Fallback: use AVERAGE peak instead of instant peak
+                            // This prevents single notification sounds from resetting the silence counter
+                            // Only sustained audio (real conversation) resets the counter
+                            if (!hasSustainedAudio) {
                                 silenceCounter[pid]++;
+                                Log(L"Silence: " + name + L" PID=" + std::to_wstring(pid) +
+                                    L" peak=" + std::to_wstring(currentPeak) +
+                                    L" avgPeak=" + std::to_wstring(avgPeak) +
+                                    L" silenceCount=" + std::to_wstring(silenceCounter[pid]) +
+                                    L"/" + std::to_wstring(config.silenceThreshold) +
+                                    L" elapsed=" + std::to_wstring(elapsedSeconds) + L"s", LogLevel::LOG_DEBUG);
                                 if (silenceCounter[pid] >= config.silenceThreshold && pastMinDuration) {
                                     Log(L"Fallback silence stop: " + name + L" PID=" + std::to_wstring(pid) +
                                         L" silenceCount=" + std::to_wstring(silenceCounter[pid]) +
+                                        L" avgPeak=" + std::to_wstring(avgPeak) +
                                         L" elapsed=" + std::to_wstring(elapsedSeconds) + L"s", LogLevel::LOG_DEBUG);
                                     shouldStop = true;
                                 }
@@ -263,7 +293,7 @@ void MonitorThread() {
                     }
 
                     // MinRecordingSeconds protection — don't stop too early
-                    if (shouldStop && !pastMinDuration) {
+                    if (shouldStop && !pastMinDuration && !pastMaxDuration) {
                         Log(L"Stop blocked by MinRecordingSeconds: " + name +
                             L" elapsed=" + std::to_wstring(elapsedSeconds) +
                             L" min=" + std::to_wstring(config.minRecordingSeconds), LogLevel::LOG_DEBUG);

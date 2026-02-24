@@ -71,6 +71,7 @@ bool LoadConfig(AgentConfig& config) {
     config.silenceThreshold    = GetIniInt(L"Monitoring", L"SilenceThreshold", config.silenceThreshold, iniPath);
     config.startThreshold      = GetIniInt(L"Monitoring", L"StartThreshold", config.startThreshold, iniPath);
     config.minRecordingSeconds = GetIniInt(L"Monitoring", L"MinRecordingSeconds", config.minRecordingSeconds, iniPath);
+    config.maxRecordingSeconds = GetIniInt(L"Monitoring", L"MaxRecordingSeconds", config.maxRecordingSeconds, iniPath);
 
     // Telegram-specific parameters
     std::wstring tgPeakStr = GetIniString(L"Monitoring", L"TelegramSilencePeakThreshold", L"0.03", iniPath);
@@ -86,6 +87,8 @@ bool LoadConfig(AgentConfig& config) {
     if (config.startThreshold > 100) config.startThreshold = 100;
     if (config.minRecordingSeconds < 0) config.minRecordingSeconds = 0;
     if (config.minRecordingSeconds > 600) config.minRecordingSeconds = 600;
+    if (config.maxRecordingSeconds < 60) config.maxRecordingSeconds = 60;
+    if (config.maxRecordingSeconds > 43200) config.maxRecordingSeconds = 43200;  // max 12 hours
     if (config.telegramSilencePeakThreshold < 0.001f) config.telegramSilencePeakThreshold = 0.001f;
     if (config.telegramSilencePeakThreshold > 1.0f) config.telegramSilencePeakThreshold = 1.0f;
     if (config.telegramPeakHistorySize < 1) config.telegramPeakHistorySize = 1;
@@ -127,6 +130,7 @@ void SaveConfig() {
     WritePrivateProfileStringW(L"Monitoring", L"SilenceThreshold", std::to_wstring(g_config.silenceThreshold).c_str(), iniPath.c_str());
     WritePrivateProfileStringW(L"Monitoring", L"StartThreshold", std::to_wstring(g_config.startThreshold).c_str(), iniPath.c_str());
     WritePrivateProfileStringW(L"Monitoring", L"MinRecordingSeconds", std::to_wstring(g_config.minRecordingSeconds).c_str(), iniPath.c_str());
+    WritePrivateProfileStringW(L"Monitoring", L"MaxRecordingSeconds", std::to_wstring(g_config.maxRecordingSeconds).c_str(), iniPath.c_str());
 
     // Telegram-specific parameters
     wchar_t tgPeakBuf[32];
