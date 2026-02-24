@@ -151,7 +151,12 @@ void MonitorThread() {
                         }
                     }
 
-                    if (!shouldStart) continue;
+                    if (!shouldStart) {
+                        // Don't let peakHistory grow indefinitely for non-recording processes
+                        if (peakHistory[pid].size() > (size_t)config.telegramPeakHistorySize * 2)
+                            peakHistory[pid].clear();
+                        continue;
+                    }
 
                     // === Begin recording ===
                     startCounter[pid] = 0;
@@ -435,7 +440,6 @@ void MonitorThread() {
             UpdateTrayTooltip();
         }
 
-        AgentConfig config = GetConfigSnapshot();
         for (int i = 0; i < config.pollIntervalSeconds * 10 && g_running; i++)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }

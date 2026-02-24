@@ -80,40 +80,60 @@ MicInfo GetDefaultMicrophone() {
     return info;
 }
 
+// ============================================================
+// BUG FIX #1: GetProcessPeakLevel and CheckProcessRealAudio
+// now iterate ALL render devices, not just the default one.
+// In RDP sessions, audio may route through a non-default device.
+// ============================================================
+
 bool AudioSessionMonitor::CheckProcessRealAudio(DWORD processId, float threshold) {
-    if (!EnsureDefaultDeviceCached()) return false;
-    return CheckSessionsOnDevice(m_cachedSessionManager, processId, threshold);
+    return (GetProcessPeakLevel(processId) > threshold);
 }
 
 float AudioSessionMonitor::GetProcessPeakLevel(DWORD processId) {
-    if (!EnsureDefaultDeviceCached()) return 0.0f;
-    if (!m_cachedSessionManager) return 0.0f;
+    if (!EnsureEnumeratorInitialized()) return 0.0f;
 
-    ComPtr<IAudioSessionEnumerator> sessionEnumerator;
-    if (FAILED(m_cachedSessionManager->GetSessionEnumerator(&sessionEnumerator)) || !sessionEnumerator) return 0.0f;
+    ComPtr<IMMDeviceCollection> deviceCollection;
+    if (FAILED(m_deviceEnumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &deviceCollection)) || !deviceCollection)
+        return 0.0f;
 
-    int sessionCount = 0;
-    sessionEnumerator->GetCount(&sessionCount);
+    UINT deviceCount = 0;
+    deviceCollection->GetCount(&deviceCount);
     float maxPeak = 0.0f;
 
-    for (int i = 0; i < sessionCount; i++) {
-        ComPtr<IAudioSessionControl> sessionControl;
-        if (FAILED(sessionEnumerator->GetSession(i, &sessionControl)) || !sessionControl) continue;
+    for (UINT d = 0; d < deviceCount; d++) {
+        ComPtr<IMMDevice> device;
+        if (FAILED(deviceCollection->Item(d, &device)) || !device) continue;
 
-        ComPtr<IAudioSessionControl2> sessionControl2;
-        if (SUCCEEDED(sessionControl.As(&sessionControl2))) {
-            DWORD sessionProcessId = 0;
-            if (SUCCEEDED(sessionControl2->GetProcessId(&sessionProcessId))) {
-                bool isMatch = (sessionProcessId == processId);
-                if (!isMatch && sessionProcessId != 0)
-                    isMatch = IsChildOfProcess(sessionProcessId, processId);
+        ComPtr<IAudioSessionManager2> sessionManager;
+        if (FAILED(device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL,
+            nullptr, reinterpret_cast<void**>(sessionManager.GetAddressOf()))) || !sessionManager) continue;
 
-                if (isMatch) {
-                    ComPtr<IAudioMeterInformation> meter;
-                    if (SUCCEEDED(sessionControl.As(&meter))) {
-                        float peakLevel = 0.0f;
-                        if (SUCCEEDED(meter->GetPeakValue(&peakLevel)) && peakLevel > maxPeak)
-                            maxPeak = peakLevel;
+        ComPtr<IAudioSessionEnumerator> sessionEnumerator;
+        if (FAILED(sessionManager->GetSessionEnumerator(&sessionEnumerator)) || !sessionEnumerator) continue;
+
+        int sessionCount = 0;
+        sessionEnumerator->GetCount(&sessionCount);
+
+        for (int i = 0; i < sessionCount; i++) {
+            ComPtr<IAudioSessionControl> sessionControl;
+            if (FAILED(sessionEnumerator->GetSession(i, &sessionControl)) || !sessionControl) continue;
+
+            ComPtr<IAudioSessionControl2> sessionControl2;
+            if (SUCCEEDED(sessionControl.As(&sessionControl2))) {
+                DWORD sessionProcessId = 0;
+                if (SUCCEEDED(sessionControl2->GetProcessId(&sessionProcessId))) {
+                    bool isMatch = (sessionProcessId == processId);
+                    if (!isMatch && sessionProcessId != 0)
+                        isMatch = IsChildOfProcess(sessionProcessId, processId);
+
+                    if (isMatch) {
+                        ComPtr<IAudioMeterInformation> meter;
+                        if (SUCCEEDED(sessionControl.As(&meter))) {
+                            float peakLevel = 0.0f;
+                            if (SUCCEEDED(meter->GetPeakValue(&peakLevel)) && peakLevel > maxPeak)
+                                maxPeak = peakLevel;
+                        }
                     }
                 }
             }
@@ -172,6 +192,8 @@ bool AudioSessionMonitor::IsSessionActive(DWORD processId) {
     return false;
 }
 
+// CheckSessionsOnDevice is no longer used as primary method,
+// but kept for compatibility with FindActiveTargetSessions
 bool AudioSessionMonitor::CheckSessionsOnDevice(ComPtr<IAudioSessionManager2>& sessionManager,
                                                   DWORD processId, float threshold) {
     if (!sessionManager) return false;
@@ -343,6 +365,8 @@ bool AudioSessionMonitor::EnsureEnumeratorInitialized() {
     return true;
 }
 
+// EnsureDefaultDeviceCached kept for backward compatibility but no longer used
+// by GetProcessPeakLevel or CheckProcessRealAudio
 bool AudioSessionMonitor::EnsureDefaultDeviceCached() {
     if (m_cachedSessionManager) return true;
     if (!EnsureEnumeratorInitialized()) return false;
