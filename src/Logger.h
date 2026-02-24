@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <atomic>
 
 enum class LogLevel {
     LOG_DEBUG = 0,
@@ -9,7 +10,7 @@ enum class LogLevel {
     LOG_ERROR = 3
 };
 
-extern LogLevel g_logLevel;
+extern std::atomic<LogLevel> g_logLevel;
 
 void InitLogger();
 void Log(const std::wstring& message, LogLevel level = LogLevel::LOG_INFO);

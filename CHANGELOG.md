@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.7.2 (2026-02-24)
+
+### Minor fix
+- Fixed data race on `g_logLevel`: changed from plain `LogLevel` to `std::atomic<LogLevel>` to prevent undefined behavior when log level is read from multiple threads.
+
 ## v2.7.1 (2026-02-24)
 
 ### Fixed audio detection on non-default devices

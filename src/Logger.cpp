@@ -11,7 +11,7 @@
 
 namespace fs = std::filesystem;
 
-LogLevel g_logLevel = LogLevel::LOG_INFO;
+std::atomic<LogLevel> g_logLevel(LogLevel::LOG_INFO);
 
 // Bug 16: Changed from std::wofstream to std::ofstream with UTF-8 encoding.
 // std::wofstream with default "C" locale cannot convert non-ASCII characters
@@ -101,7 +101,7 @@ void UpdateLoggerConfig() {
 void Log(const std::wstring& message, LogLevel level) {
     // Bug 9: use cached atomic instead of GetConfigSnapshot()
     if (!g_loggingEnabled.load(std::memory_order_relaxed)) return;
-    if (level < g_logLevel) return;
+    if (level < g_logLevel.load(std::memory_order_relaxed)) return;
 
     auto now = std::chrono::system_clock::now();
     auto time_t_now = std::chrono::system_clock::to_time_t(now);
