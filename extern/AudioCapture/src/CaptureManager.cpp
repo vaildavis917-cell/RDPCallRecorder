@@ -424,13 +424,22 @@ void CaptureManager::OnAudioData(DWORD processId, const BYTE* data, UINT32 size)
         }
     }
 
-    // If mixed recording is enabled, also send data to the mixer
-    if (mixedEnabled && m_mixer) {
-        m_mixer->AddAudioData(processId, data, size, captureFormat);
+    // If mixed recording is enabled, also send data to the mixer.
+    // FIX: Hold m_mixerMutex for the full AddAudioData call to prevent
+    // DisableMixedRecording() from destroying m_mixer while we use it.
+    // AddAudioData is fast (just appends to buffer), so lock contention is minimal.
+    if (mixedEnabled) {
+        std::lock_guard<std::mutex> mixLock(m_mixerMutex);
+        if (m_mixedRecordingEnabled && m_mixer) {
+            m_mixer->AddAudioData(processId, data, size, captureFormat);
+        }
     }
 }
 
 bool CaptureManager::EnableMixedRecording(const std::wstring& outputPath, AudioFormat format, UINT32 bitrate) {
+    // FIX: Lock m_mutex first to safely read m_sessions, then m_mixerMutex.
+    // Previous code only held m_mixerMutex — data race with OnAudioData/StopCapture.
+    std::lock_guard<std::mutex> sessLock(m_mutex);
     std::lock_guard<std::mutex> lock(m_mixerMutex);
 
     if (m_mixedRecordingEnabled) {

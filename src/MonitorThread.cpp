@@ -26,7 +26,7 @@ namespace fs = std::filesystem;
 // Call detection strategy (hybrid approach):
 //
 // START recording:
-//   - Telegram: sessionActive/hasRealAudio + IsTelegramInCall() (window title check)
+//   - Telegram: hasRealAudio (audio peak > threshold) + IsTelegramInCall() (window title check)
 //   - Other apps: audio peak detected (startThreshold cycles)
 //
 // STOP recording:
@@ -437,6 +437,23 @@ void MonitorThread() {
             Log(L"[UI] Force start recording requested");
             AgentConfig cfgStart = GetConfigSnapshot();
             std::vector<FoundProcess> forceProcs = FindTargetProcesses(cfgStart);
+
+            // Deduplicate parent/child (same as main loop) to avoid recording from wrong process
+            {
+                std::set<DWORD> pidsToRemove;
+                for (auto& tp1 : forceProcs) {
+                    for (auto& tp2 : forceProcs) {
+                        if (tp1.pid != tp2.pid && IsChildOfProcess(tp1.pid, tp2.pid, procSnap)) {
+                            pidsToRemove.insert(tp2.pid);
+                        }
+                    }
+                }
+                forceProcs.erase(
+                    std::remove_if(forceProcs.begin(), forceProcs.end(),
+                        [&](const FoundProcess& fp) { return pidsToRemove.count(fp.pid) > 0; }),
+                    forceProcs.end());
+            }
+
             for (auto& tp : forceProcs) {
                 DWORD pid = tp.pid;
                 if (callState[pid].isRecording) continue;

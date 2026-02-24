@@ -398,6 +398,8 @@ void AutoUpdateThread() {
 
     // Then check periodically
     while (g_running) {
+        // FIX: Refresh config BEFORE reading interval so changes take effect immediately
+        config = GetConfigSnapshot();
         int hours = config.updateCheckIntervalHours;
         for (int i = 0; i < hours * 60 && g_running; i++)
             std::this_thread::sleep_for(std::chrono::minutes(1));

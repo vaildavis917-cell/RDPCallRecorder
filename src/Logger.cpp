@@ -65,10 +65,10 @@ static void EnsureLogFileOpen(const fs::path& logDir) {
 
     if (!g_logFile.is_open()) {
         try { fs::create_directories(logDir); } catch (...) {}
-        // Bug 16: use narrow ofstream with UTF-8 conversion
-        std::string utf8Path = WideToUtf8(logPath);
+        // Bug 16: use fs::path overload to handle non-ASCII paths correctly
+        // (narrow ofstream::open with UTF-8 string won't work — Windows uses ANSI codepage)
         bool isNewFile = !fs::exists(logFile);
-        g_logFile.open(utf8Path, std::ios::app | std::ios::binary);
+        g_logFile.open(logFile, std::ios::app | std::ios::binary);
         g_logFilePath = logPath;
         // Write UTF-8 BOM for new files so text editors detect encoding
         if (isNewFile && g_logFile.is_open()) {
