@@ -116,38 +116,24 @@ Program is installed to:
 
 ### Dependencies
 
-This project uses the [AudioCapture](https://github.com/masonasons/AudioCapture) library. Clone it alongside this project:
+The [AudioCapture](https://github.com/masonasons/AudioCapture) library is bundled in `extern/AudioCapture/` — no need to clone it separately.
 
 ```cmd
-cd C:\Projects
-git clone https://github.com/masonasons/AudioCapture.git
 git clone https://github.com/vaildavis917-cell/RDPCallRecorder.git
 ```
 
 ### Build Steps
 
-1. **Run the dependency setup script** (copies stub headers to avoid Opus/FLAC dependencies):
+Use the included `build.bat` script (requires x64 Native Tools Command Prompt for VS):
+
 ```cmd
 cd RDPCallRecorder
-setup_deps.bat
+build.bat
 ```
 
-2. **Open x64 Native Tools Command Prompt for VS** and build:
-```cmd
-cd RDPCallRecorder
-mkdir build && cd build
-cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release
-ninja
-```
+For a full rebuild: `build.bat clean`
 
-3. **Build the installer** (optional):
-```cmd
-mkdir ..\installer\files
-copy bin\RDPCallRecorder.exe ..\installer\files\
-copy ..\config.ini ..\installer\files\
-cd ..\installer
-"C:\Program Files (x86)\NSIS\makensis.exe" installer.nsi
-```
+The script handles CMake configuration, Ninja build, and NSIS installer generation automatically.
 
 ## Configuration File
 
@@ -204,4 +190,4 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE) for detai
 
 ## Acknowledgments
 
-- [AudioCapture](https://github.com/masonasons/AudioCapture) library by masonasons — WASAPI audio capture, mixing, and encoding
+- [AudioCapture](https://github.com/masonasons/AudioCapture) library by masonasons — WASAPI audio capture, mixing, and encoding (bundled in `extern/AudioCapture/`)

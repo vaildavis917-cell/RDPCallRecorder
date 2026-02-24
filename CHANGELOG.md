@@ -1,5 +1,54 @@
 # Changelog
 
+## v2.6.7 (2026-02-24)
+
+### Fixed audio detection on non-default devices
+- Fixed `GetProcessPeakLevel()` scanning only the default render device — now enumerates all active render devices. This fixes missed recordings in RDP sessions where the app audio plays on a non-default endpoint.
+- Added periodic WASAPI enumerator reset (~30 seconds) to handle device changes during RDP reconnections.
+- Removed stale cached device/session manager that could go stale after device changes.
+
+### Fixed Telegram false positives
+- Improved `IsTelegramInCall()` to filter out media viewer windows (`.jpg`, `.mp4`, `.webm`, etc.) that were incorrectly detected as call windows.
+
+### Fixed process snapshot spam
+- Added `ProcessSnapshot` struct — one `CreateToolhelp32Snapshot` per monitoring cycle instead of dozens. Snapshot is passed through `GetProcessPeakLevel`, `IsSessionActive`, and `DumpAudioSessions`.
+
+### Fixed COM threading mismatch
+- Changed main thread COM initialization from `COINIT_APARTMENTTHREADED` to `COINIT_MULTITHREADED` to match the monitor thread.
+
+### Fixed duplicate recordings for parent/child processes
+- Added deduplication: if both `WhatsApp.exe` and `WhatsApp.Root.exe` are found, only the child process (the one actually playing audio) is recorded.
+
+### Fixed Logger performance
+- Cached `enableLogging` flag via `std::atomic` — removed `GetConfigSnapshot()` mutex lock on every `Log()` call.
+- Added periodic flush every 10 log lines (previously only flushed on WARN/ERROR, losing DEBUG/INFO on crash).
+
+### Fixed UI performance
+- Changed `StatusData::m_logRing` from `std::vector` to `std::deque` — `pop_front()` is now O(1) instead of O(n).
+- Changed `RefreshStatusTab` log view from full rewrite to append-only — eliminates flicker and reduces CPU usage.
+- Added `EM_SETLIMITTEXT` (100KB) to log edit control.
+
+### Fixed auto-update JSON parser
+- `ExtractJsonString` now verifies the matched key is followed by `:` — prevents false matches when the key appears as a value in the JSON body.
+
+### Fixed tiny/empty recording files
+- Recordings smaller than 10KB are automatically deleted after stop (likely false triggers).
+
+### Fixed double config read in MonitorThread
+- Removed redundant `GetConfigSnapshot()` call before the sleep loop — reuses the config from the beginning of the cycle.
+
+### Fixed peakHistory memory growth
+- Peak history for non-recording processes is now cleared when it exceeds 2x the configured window size.
+
+### Improved Globals.h
+- Changed all `static const` declarations to `inline constexpr` — eliminates symbol duplication across translation units.
+
+### Bundled AudioCapture
+- AudioCapture library is now included in `extern/AudioCapture/` inside the repository. No need to clone it separately.
+
+### Configuration
+- Added explicit `MaxRecordingSeconds=7200` to `config.ini` for transparency (2-hour safety limit).
+
 ## v2.6.5 (2026-02-20)
 
 ### Fixed recording fragmentation (short clips instead of continuous recording)

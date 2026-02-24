@@ -81,11 +81,11 @@
 ## Сборка из исходников
 
 1. **Установите зависимости:** Visual Studio 2022 (C++), CMake, NSIS.
-2. **Клонируйте репозитории:**
+2. **Клонируйте репозиторий:**
    ```cmd
-   git clone https://github.com/masonasons/AudioCapture.git
    git clone https://github.com/vaildavis917-cell/RDPCallRecorder.git
    ```
+   AudioCapture уже включён в `extern/AudioCapture/` — отдельно клонировать не нужно.
 3. **Запустите `build.bat`:**
    ```cmd
    cd RDPCallRecorder
