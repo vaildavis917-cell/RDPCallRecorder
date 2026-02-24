@@ -29,15 +29,23 @@ static std::wstring StripVersionPrefix(const std::wstring& tag) {
 
 static std::wstring ExtractJsonString(const std::wstring& json, const std::wstring& key) {
     std::wstring search = L"\"" + key + L"\"";
-    size_t pos = json.find(search);
-    if (pos == std::wstring::npos) return L"";
-    pos = json.find(L':', pos + search.length());
-    if (pos == std::wstring::npos) return L"";
-    pos = json.find(L'"', pos + 1);
-    if (pos == std::wstring::npos) return L"";
-    size_t end = json.find(L'"', pos + 1);
-    if (end == std::wstring::npos) return L"";
-    return json.substr(pos + 1, end - pos - 1);
+    size_t pos = 0;
+    while ((pos = json.find(search, pos)) != std::wstring::npos) {
+        // Bug 13: verify that the next non-whitespace char after the key is ':'
+        size_t afterKey = pos + search.length();
+        while (afterKey < json.size() && (json[afterKey] == L' ' || json[afterKey] == L'\t'))
+            afterKey++;
+        if (afterKey >= json.size() || json[afterKey] != L':') {
+            pos = afterKey;
+            continue;  // this is a value, not a key — skip
+        }
+        size_t valStart = json.find(L'"', afterKey + 1);
+        if (valStart == std::wstring::npos) return L"";
+        size_t valEnd = json.find(L'"', valStart + 1);
+        if (valEnd == std::wstring::npos) return L"";
+        return json.substr(valStart + 1, valEnd - valStart - 1);
+    }
+    return L"";
 }
 
 static std::wstring WinHttpGet(const std::wstring& host, const std::wstring& path) {

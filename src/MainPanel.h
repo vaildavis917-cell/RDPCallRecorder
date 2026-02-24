@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <string>
 #include <vector>
+#include <deque>
 #include <mutex>
 #include <chrono>
 
@@ -32,7 +33,7 @@ public:
 private:
     std::mutex m_mutex;
     std::vector<ActiveRecordingInfo> m_recordings;
-    std::vector<std::wstring> m_logRing;
+    std::deque<std::wstring> m_logRing;
 };
 
 extern StatusData g_statusData;

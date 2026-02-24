@@ -30,6 +30,10 @@ std::vector<FoundProcess> FindTargetProcesses(const AgentConfig& config) {
     return result;
 }
 
+// ============================================================
+// Legacy functions (each creates its own snapshot)
+// ============================================================
+
 std::wstring GetProcessNameByPid(DWORD pid) {
     if (pid == 0) return L"(system)";
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -66,6 +70,49 @@ bool IsChildOfProcess(DWORD childPid, DWORD parentPid) {
     DWORD current = childPid;
     for (int depth = 0; depth < 3; depth++) {
         DWORD parent = GetParentProcessId(current);
+        if (parent == 0 || parent == current) return false;
+        if (parent == parentPid) return true;
+        current = parent;
+    }
+    return false;
+}
+
+// ============================================================
+// Snapshot-based functions (one snapshot per cycle)
+// ============================================================
+
+void ProcessSnapshot::Refresh() {
+    parentMap.clear();
+    nameMap.clear();
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return;
+    PROCESSENTRY32W pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
+    if (Process32FirstW(hSnapshot, &pe32)) {
+        do {
+            parentMap[pe32.th32ProcessID] = pe32.th32ParentProcessID;
+            nameMap[pe32.th32ProcessID] = pe32.szExeFile;
+        } while (Process32NextW(hSnapshot, &pe32));
+    }
+    CloseHandle(hSnapshot);
+}
+
+std::wstring GetProcessNameByPid(DWORD pid, const ProcessSnapshot& snap) {
+    if (pid == 0) return L"(system)";
+    auto it = snap.nameMap.find(pid);
+    return (it != snap.nameMap.end()) ? it->second : L"(unknown)";
+}
+
+DWORD GetParentProcessId(DWORD pid, const ProcessSnapshot& snap) {
+    if (pid == 0) return 0;
+    auto it = snap.parentMap.find(pid);
+    return (it != snap.parentMap.end()) ? it->second : 0;
+}
+
+bool IsChildOfProcess(DWORD childPid, DWORD parentPid, const ProcessSnapshot& snap) {
+    DWORD current = childPid;
+    for (int depth = 0; depth < 3; depth++) {
+        DWORD parent = GetParentProcessId(current, snap);
         if (parent == 0 || parent == current) return false;
         if (parent == parentPid) return true;
         current = parent;

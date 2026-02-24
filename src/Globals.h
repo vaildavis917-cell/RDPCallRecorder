@@ -16,24 +16,24 @@
 #define IDM_EXIT           1004
 #define IDM_CHECK_UPDATE   1005
 
-static const wchar_t* WINDOW_CLASS_NAME = L"RDPCallRecorderWndClass";
-static const wchar_t* APP_TITLE = L"RDP Call Recorder";
-static const wchar_t* APP_VERSION = L"2.6.7";
-static const wchar_t* GITHUB_REPO_OWNER = L"vaildavis917-cell";
-static const wchar_t* GITHUB_REPO_NAME = L"RDPCallRecorder";
-static const int UPDATE_CHECK_INTERVAL_HOURS = 6;
-static const wchar_t* MUTEX_SINGLE_INSTANCE = L"Local\\RDPCallRecorder_SingleInstance";
-static const DWORD MIC_SESSION_ID_BASE = 0xF0000000;
+inline constexpr wchar_t WINDOW_CLASS_NAME[] = L"RDPCallRecorderWndClass";
+inline constexpr wchar_t APP_TITLE[] = L"RDP Call Recorder";
+inline constexpr wchar_t APP_VERSION[] = L"2.6.7";
+inline constexpr wchar_t GITHUB_REPO_OWNER[] = L"vaildavis917-cell";
+inline constexpr wchar_t GITHUB_REPO_NAME[] = L"RDPCallRecorder";
+inline constexpr int UPDATE_CHECK_INTERVAL_HOURS = 6;
+inline constexpr wchar_t MUTEX_SINGLE_INSTANCE[] = L"Local\\RDPCallRecorder_SingleInstance";
+inline constexpr DWORD MIC_SESSION_ID_BASE = 0xF0000000;
 
-static const float AUDIO_PEAK_THRESHOLD = 0.01f;
-static const int INI_BUFFER_SIZE = 1024;
-static const int NAME_BUFFER_SIZE = 256;
-static const int TRAY_TIP_MAX_LEN = 128;
-static const int LOG_TIMESTAMP_BUF = 64;
-static const int SETTINGS_DLG_WIDTH = 500;
-static const int SETTINGS_DLG_HEIGHT = 420;
-static const UINT32 MIN_MP3_BITRATE = 32000;
-static const UINT32 MAX_MP3_BITRATE = 320000;
+inline constexpr float AUDIO_PEAK_THRESHOLD = 0.01f;
+inline constexpr int INI_BUFFER_SIZE = 1024;
+inline constexpr int NAME_BUFFER_SIZE = 256;
+inline constexpr int TRAY_TIP_MAX_LEN = 128;
+inline constexpr int LOG_TIMESTAMP_BUF = 64;
+inline constexpr int SETTINGS_DLG_WIDTH = 500;
+inline constexpr int SETTINGS_DLG_HEIGHT = 420;
+inline constexpr UINT32 MIN_MP3_BITRATE = 32000;
+inline constexpr UINT32 MAX_MP3_BITRATE = 320000;
 
 extern HWND g_hWndMain;
 extern NOTIFYICONDATAW g_nid;
