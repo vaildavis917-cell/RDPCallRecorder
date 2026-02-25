@@ -111,10 +111,18 @@ xcopy "%BUILD_DIR%\bin\RDPCallRecorder.exe" "%INSTALLER_DIR%\files\" /Y >NUL
 echo [OK] Copied RDPCallRecorder.exe to installer\files\
 if exist "%PROJECT_DIR%config.ini" (
     xcopy "%PROJECT_DIR%config.ini" "%INSTALLER_DIR%\files\" /Y >NUL
+    if !ERRORLEVEL! neq 0 (
+        echo [ERROR] Failed to copy config.ini from project root!
+        exit /b 1
+    )
     echo [OK] Copied config.ini to installer\files\
 ) else (
-    echo [ERROR] config.ini not found in project root!
-    exit /b 1
+    echo [WARN] config.ini not found in project root. Creating a default one.
+    echo [General] > "%INSTALLER_DIR%\files\config.ini"
+    echo LogLevel=INFO >> "%INSTALLER_DIR%\files\config.ini"
+    echo MaxLogSizeMB=10 >> "%INSTALLER_DIR%\files\config.ini"
+    echo MaxRecordingSeconds=7200 >> "%INSTALLER_DIR%\files\config.ini"
+    echo [OK] Created default config.ini in installer\files\
 )
 
 :: --- Build NSIS installer ---
